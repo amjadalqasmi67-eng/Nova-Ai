@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1E1B4B" />
+      <stop offset="58%" stop-color="#0B1024" />
+      <stop offset="100%" stop-color="#050711" />
+    </radialGradient>
+    <radialGradient id="starAura" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3B82F6" stop-opacity="0.45" />
+      <stop offset="55%" stop-color="#8B5CF6" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#050711" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="starGrad" x1="88" y1="88" x2="424" y2="424" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="48%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#8B5CF6" />
+    </linearGradient>
+    <linearGradient id="orbitGrad" x1="60" y1="120" x2="452" y2="392" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.9" />
+      <stop offset="50%" stop-color="#A78BFA" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.9" />
+    </linearGradient>
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="45%" stop-color="#93C5FD" stop-opacity="0.85" />
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bgGlow)" />
+  <circle cx="256" cy="256" r="210" fill="url(#starAura)" />
+  <ellipse cx="256" cy="256" rx="194" ry="82" transform="rotate(-28 256 256)" stroke="url(#orbitGrad)" stroke-width="8" opacity="0.85" />
+  <path d="M256 124 L276 236 L388 256 L276 276 L256 388 L236 276 L124 256 L236 236 Z" transform="rotate(45 256 256)" fill="url(#starGrad)" opacity="0.38" />
+  <path d="M256 64 C270 198 314 242 448 256 C314 270 270 314 256 448 C242 314 198 270 64 256 C198 242 242 198 256 64 Z" fill="url(#starGrad)" />
+  <path d="M256 144 C264 214 298 248 368 256 C298 264 264 298 256 368 C248 298 214 264 144 256 C214 248 248 214 256 144 Z" fill="url(#coreGlow)" />
+  <circle cx="386" cy="132" r="13" fill="#93C5FD" />
+</svg>

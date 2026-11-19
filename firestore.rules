@@ -1,0 +1,235 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.email == 'amjad.alqasmi67@gmail.com';
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'customInstruction', 'accentColor', 'themeMode', 'createdAt', 'updatedAt'])
+        && data.uid is string
+        && data.uid == userId
+        && data.uid == request.auth.uid
+        && isValidId(data.uid)
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 120
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 200
+        && (!('customInstruction' in data) || (data.customInstruction is string && data.customInstruction.size() <= 1000))
+        && (!('accentColor' in data) || (data.accentColor in ['violet', 'blue', 'emerald', 'rose']))
+        && (!('themeMode' in data) || (data.themeMode in ['dark', 'light']))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidConversation(data, userId) {
+      return data.keys().hasAll(['userId', 'title', 'lastMessagePreview', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'title', 'lastMessagePreview', 'createdAt', 'updatedAt'])
+        && data.userId is string
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && isValidId(data.userId)
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 120
+        && data.lastMessagePreview is string
+        && data.lastMessagePreview.size() <= 240
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMessage(data, userId, conversationId) {
+      return data.keys().hasAll(['userId', 'conversationId', 'role', 'content', 'hasAttachment', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'conversationId', 'role', 'content', 'hasAttachment', 'createdAt'])
+        && data.userId is string
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && isValidId(data.userId)
+        && data.conversationId is string
+        && data.conversationId == conversationId
+        && isValidId(data.conversationId)
+        && data.role in ['user', 'assistant']
+        && data.content is string
+        && data.content.size() >= 1
+        && data.content.size() <= 20000
+        && data.hasAttachment is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidContactMessage(data) {
+      return data.keys().hasAll(['userId', 'senderName', 'senderEmail', 'category', 'message', 'status', 'triageLevel', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'senderName', 'senderEmail', 'category', 'message', 'status', 'triageLevel', 'aiReply', 'aiSummary', 'createdAt', 'triagedAt'])
+        && data.userId is string
+        && isValidId(data.userId)
+        && data.senderName is string
+        && data.senderName.size() >= 1
+        && data.senderName.size() <= 120
+        && data.senderEmail is string
+        && data.senderEmail.size() >= 3
+        && data.senderEmail.size() <= 200
+        && data.category in ['issue', 'suggestion', 'general']
+        && data.message is string
+        && data.message.size() >= 5
+        && data.message.size() <= 3000
+        && data.status in ['new', 'reviewed']
+        && data.triageLevel in ['pending', 'simple', 'urgent']
+        && (!('aiReply' in data) || (data.aiReply is string && data.aiReply.size() <= 4000))
+        && (!('aiSummary' in data) || (data.aiSummary is string && data.aiSummary.size() <= 500))
+        && data.createdAt is timestamp
+        && (!('triagedAt' in data) || data.triagedAt is timestamp);
+    }
+
+    function isValidVisitLog(data) {
+      return data.keys().hasAll(['userId', 'dateKey', 'deviceType', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'dateKey', 'deviceType', 'createdAt'])
+        && data.userId is string
+        && isValidId(data.userId)
+        && data.userId == request.auth.uid
+        && data.dateKey is string
+        && data.dateKey.size() == 10
+        && data.dateKey.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && data.deviceType in ['mobile', 'tablet', 'desktop']
+        && data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'customInstruction', 'accentColor', 'themeMode', 'updatedAt']);
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      match /conversations/{conversationId} {
+        allow get: if isValidId(userId) && isValidId(conversationId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.userId == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(conversationId)
+          && isOwner(userId)
+          && isValidConversation(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId)
+          && isValidId(conversationId)
+          && isOwner(userId)
+          && isValidConversation(incoming(), userId)
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'lastMessagePreview', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(conversationId) && isOwner(userId);
+
+        match /messages/{messageId} {
+          allow get: if isValidId(userId) && isValidId(conversationId) && isValidId(messageId) && isOwner(userId);
+          allow list: if isOwner(userId)
+            && resource.data.userId == request.auth.uid
+            && resource.data.conversationId == conversationId;
+          allow create: if isValidId(userId)
+            && isValidId(conversationId)
+            && isValidId(messageId)
+            && isOwner(userId)
+            && isValidMessage(incoming(), userId, conversationId)
+            && incoming().createdAt == request.time
+            && exists(/databases/$(database)/documents/users/$(userId)/conversations/$(conversationId))
+            && get(/databases/$(database)/documents/users/$(userId)/conversations/$(conversationId)).data.userId == request.auth.uid;
+          allow update: if false;
+          allow delete: if isValidId(userId) && isValidId(conversationId) && isValidId(messageId) && isOwner(userId);
+        }
+      }
+    }
+
+    match /contactMessages/{messageId} {
+      allow get: if isValidId(messageId) && (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+      allow list: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isValidId(messageId)
+        && isSignedIn()
+        && isValidContactMessage(incoming())
+        && incoming().userId == request.auth.uid
+        && incoming().senderEmail == request.auth.token.email
+        && incoming().status == 'new'
+        && incoming().triageLevel == 'pending'
+        && !('aiReply' in incoming())
+        && !('aiSummary' in incoming())
+        && !('triagedAt' in incoming())
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(messageId)
+        && isValidContactMessage(incoming())
+        && incoming().userId == existing().userId
+        && incoming().senderName == existing().senderName
+        && incoming().senderEmail == existing().senderEmail
+        && incoming().category == existing().category
+        && incoming().message == existing().message
+        && incoming().createdAt == existing().createdAt
+        && (
+          (
+            isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'triageLevel'])
+          )
+          ||
+          (
+            isSignedIn()
+            && existing().userId == request.auth.uid
+            && (!('triageLevel' in existing()) || existing().triageLevel == 'pending')
+            && incoming().triageLevel in ['simple', 'urgent']
+            && incoming().status == existing().status
+            && ('aiReply' in incoming())
+            && incoming().aiReply.size() >= 1
+            && ('aiSummary' in incoming())
+            && incoming().aiSummary.size() >= 1
+            && incoming().triagedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['triageLevel', 'aiReply', 'aiSummary', 'triagedAt'])
+          )
+        );
+      allow delete: if isValidId(messageId) && (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+    }
+
+    match /visitLogs/{visitId} {
+      allow get: if isValidId(visitId) && (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+      allow list: if isAdmin();
+      allow create: if isValidId(visitId)
+        && isSignedIn()
+        && isValidVisitLog(incoming())
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(visitId) && isAdmin();
+    }
+  }
+}
