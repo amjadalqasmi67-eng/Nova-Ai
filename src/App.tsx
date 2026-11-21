@@ -24,6 +24,7 @@ import {
   BookOpen,
   HelpCircle,
   Mail,
+  ClipboardCheck,
 } from 'lucide-react';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from './firebase';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -33,6 +34,7 @@ import { LoginGate } from './components/LoginGate';
 import { OtpGate } from './components/OtpGate';
 import { ChatWorkspace } from './components/ChatWorkspace';
 import { PresentationStudio } from './components/PresentationStudio';
+import { ExamStudio } from './components/ExamStudio';
 import { AboutPage } from './components/AboutPage';
 import { HelpPage } from './components/HelpPage';
 import { FaqPage } from './components/FaqPage';
@@ -67,14 +69,14 @@ import {
 } from './lib/pinSecurity';
 import { getOtpHeaders, setOtpSessionToken } from './lib/otpSession';
 
-type PrimaryTab = 'chat' | 'pptx' | 'about' | 'help' | 'faq' | 'contact' | 'owner';
+type PrimaryTab = 'chat' | 'pptx' | 'exam' | 'about' | 'help' | 'faq' | 'contact' | 'owner';
 type StudioTab = PrimaryTab | 'settings';
 
 const PUBLIC_NAV_TABS: Array<{ id: PrimaryTab; label: string; icon: typeof MessageSquare }> = [
   { id: 'chat', label: 'المحادثة الذكية', icon: MessageSquare },
   { id: 'pptx', label: 'عروض PowerPoint', icon: Presentation },
+  { id: 'exam', label: 'صانع الاختبارات', icon: ClipboardCheck },
   { id: 'about', label: 'من نحن', icon: Info },
-  { id: 'help', label: 'مساعدة', icon: BookOpen },
   { id: 'contact', label: 'تواصل معنا', icon: Mail },
 ];
 
@@ -195,9 +197,13 @@ function NovaApplication() {
           if (otpRes.ok) {
             const otpData = (await otpRes.json()) as {
               otpRequired?: boolean;
+              otpToken?: string;
               emailMasked?: string;
               cooldownRemainingSec?: number;
             };
+            if (otpData.otpToken) {
+              setOtpSessionToken(otpData.otpToken);
+            }
             setOtpEmailMasked(otpData.emailMasked || firebaseUser.email || '');
             setOtpCooldownSec(
               typeof otpData.cooldownRemainingSec === 'number' ? otpData.cooldownRemainingSec : 0
@@ -272,7 +278,27 @@ function NovaApplication() {
     }
   };
 
+  const clearServerOtpSession = async () => {
+    try {
+      const current = auth.currentUser;
+      if (current) {
+        const idToken = await current.getIdToken();
+        await fetch('/api/auth/otp/logout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({}),
+        });
+      }
+    } catch {
+      // Non-blocking logout cleanup
+    }
+  };
+
   const handleSwitchAccount = async () => {
+    await clearServerOtpSession();
     setOtpSessionToken(null);
     setOtpStatus('idle');
     googleProvider.setCustomParameters({ prompt: 'select_account' });
@@ -280,6 +306,7 @@ function NovaApplication() {
   };
 
   const handleSignOut = async () => {
+    await clearServerOtpSession();
     setOtpSessionToken(null);
     setOtpStatus('idle');
     setOtpEmailMasked('');
@@ -682,6 +709,22 @@ function NovaApplication() {
 
                     <button
                       type="button"
+                      onClick={() => navigateTo('help')}
+                      className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                        activeTab === 'help'
+                          ? 'accent-active-tab text-slate-900 dark:text-white'
+                          : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
+                      }`}
+                    >
+                      <BookOpen
+                        className="w-4 h-4 shrink-0"
+                        style={activeTab === 'help' ? { color: 'var(--accent-primary)' } : undefined}
+                      />
+                      <span>دليل المساعدة</span>
+                    </button>
+
+                    <button
+                      type="button"
                       onClick={() => navigateTo('faq')}
                       className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
                         activeTab === 'faq'
@@ -799,6 +842,7 @@ function NovaApplication() {
                     onConsumeInitialTopic={() => setPptxTopicDraft(null)}
                   />
                 )}
+                {activeTab === 'exam' && <ExamStudio user={user} />}
                 {activeTab === 'about' && (
                   <AboutPage
                     onGoToChat={() => navigateTo('chat')}

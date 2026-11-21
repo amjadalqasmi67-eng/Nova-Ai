@@ -1,6 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
 import { User } from 'firebase/auth';
-import { Mic, MicOff, PhoneOff, Volume2, Radio, MessageSquarePlus, Sparkles } from 'lucide-react';
+import {
+  Mic,
+  MicOff,
+  PhoneOff,
+  Volume2,
+  Radio,
+  MessageSquarePlus,
+  Sparkles,
+  Play,
+} from 'lucide-react';
 import { NovaStarLogo } from './NovaStarLogo';
 import { getOtpSessionToken, getOtpHeaders } from '../lib/otpSession';
 
@@ -8,6 +17,8 @@ interface VoiceTurnEntry {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  audioBase64?: string | null;
+  mimeType?: string | null;
 }
 
 interface LiveVoiceModalProps {
@@ -33,11 +44,16 @@ function downsampleTo16kPCM(input: Float32Array, inputSampleRate: number): strin
     samples = input;
   } else {
     const ratio = inputSampleRate / targetRate;
-    const newLength = Math.max(1, Math.round(input.length / ratio));
+    const newLength = Math.max(1, Math.floor(input.length / ratio));
     samples = new Float32Array(newLength);
     for (let i = 0; i < newLength; i++) {
-      const idx = Math.min(input.length - 1, Math.floor(i * ratio));
-      samples[i] = input[idx];
+      const start = Math.floor(i * ratio);
+      const end = Math.min(input.length, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+      let sum = 0;
+      for (let j = start; j < end; j++) {
+        sum += input[j];
+      }
+      samples[i] = sum / (end - start);
     }
   }
 
@@ -56,18 +72,55 @@ function downsampleTo16kPCM(input: Float32Array, inputSampleRate: number): strin
   return btoa(binary);
 }
 
-function base64ToFloat32From24kPCM(base64: string): Float32Array {
+function base64ToUint8Array(base64: string): Uint8Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
+  return bytes;
+}
+
+function base64ToFloat32From24kPCM(base64: string): Float32Array {
+  const bytes = base64ToUint8Array(base64);
   const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) {
     float32[i] = int16[i] / 32768;
   }
   return float32;
+}
+
+function pickSupportedRecorderMime(): string {
+  if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
+    return 'audio/webm';
+  }
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+  ];
+  for (const mime of candidates) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      return mime;
+    }
+  }
+  return '';
+}
+
+function createAudioContextSafe(preferredSampleRate?: number): AudioContext {
+  const AudioCtx =
+    window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  if (preferredSampleRate) {
+    try {
+      return new AudioCtx({ sampleRate: preferredSampleRate });
+    } catch {
+      return new AudioCtx();
+    }
+  }
+  return new AudioCtx();
 }
 
 export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns }: LiveVoiceModalProps) {
@@ -78,10 +131,12 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isRecordingTurn, setIsRecordingTurn] = useState(false);
   const [isProcessingTurn, setIsProcessingTurn] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
   const [entries, setEntries] = useState<VoiceTurnEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const isMutedRef = useRef(false);
+  const modeRef = useRef<'connecting' | 'live' | 'turn-fallback'>('connecting');
   const wsRef = useRef<WebSocket | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
@@ -89,12 +144,17 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const htmlAudioRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const currentUserBufferRef = useRef('');
   const currentAiBufferRef = useRef('');
   const entriesRef = useRef<VoiceTurnEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -105,6 +165,16 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [entries]);
 
+  const stopBrowserSpeech = () => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   const stopPlaybackQueue = () => {
     activeSourcesRef.current.forEach((src) => {
       try {
@@ -114,14 +184,155 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
       }
     });
     activeSourcesRef.current.clear();
+    if (htmlAudioRef.current) {
+      try {
+        htmlAudioRef.current.pause();
+      } catch {
+        // ignore
+      }
+      htmlAudioRef.current = null;
+    }
+    stopBrowserSpeech();
     if (outputAudioCtxRef.current) {
       nextStartTimeRef.current = outputAudioCtxRef.current.currentTime;
     }
     setIsAiSpeaking(false);
   };
 
-  const cleanupAllAudio = () => {
+  const unlockAudioContexts = async () => {
+    try {
+      if (inputAudioCtxRef.current && inputAudioCtxRef.current.state === 'suspended') {
+        await inputAudioCtxRef.current.resume();
+      }
+      if (!outputAudioCtxRef.current) {
+        outputAudioCtxRef.current = createAudioContextSafe(24000);
+        nextStartTimeRef.current = outputAudioCtxRef.current.currentTime;
+      }
+      if (outputAudioCtxRef.current.state === 'suspended') {
+        await outputAudioCtxRef.current.resume();
+      }
+      setAudioBlocked(outputAudioCtxRef.current.state === 'suspended');
+    } catch {
+      // ignore resume errors until user gesture
+    }
+  };
+
+  const speakWithBrowserFallback = (text: string) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window) || !text.trim()) {
+      setIsAiSpeaking(false);
+      return;
+    }
+    try {
+      const voices = window.speechSynthesis.getVoices();
+      const arabicVoice = voices.find((v) => v.lang.toLowerCase().startsWith('ar'));
+      if (!arabicVoice) {
+        setIsAiSpeaking(false);
+        setStatusText('تم عرض الرد كتابيًا (الصوت العربي المحلي غير متوفر على هذا الجهاز)');
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+      const cleanSpeech = text
+        .replace(/https?:\/\/\S+/g, ' ')
+        .replace(/[*#`>_~[\](){}|\\]/g, ' ')
+        .replace(/\bNova AI\b/gi, 'نوفا')
+        .replace(/%/g, ' بالمئة ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!cleanSpeech) {
+        setIsAiSpeaking(false);
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(cleanSpeech);
+      utterance.voice = arabicVoice;
+      utterance.lang = arabicVoice.lang || 'ar-SA';
+      utterance.rate = 0.98;
+      utterance.onstart = () => {
+        setIsAiSpeaking(true);
+        setStatusText('Nova AI يتحدث الآن...');
+      };
+      utterance.onend = () => {
+        setIsAiSpeaking(false);
+        setStatusText('اضغط للتحدث مجددًا مع Nova AI');
+      };
+      utterance.onerror = () => {
+        setIsAiSpeaking(false);
+        setStatusText('اضغط للتحدث مجددًا مع Nova AI');
+      };
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      setIsAiSpeaking(false);
+    }
+  };
+
+  const playReplyAudio = async (audioBase64: string | null | undefined, mimeType: string | null | undefined, replyText: string) => {
     stopPlaybackQueue();
+
+    if (!audioBase64 || !mimeType) {
+      speakWithBrowserFallback(replyText);
+      return;
+    }
+
+    await unlockAudioContexts();
+
+    // Primary: Decode WAV directly through the unlocked Output AudioContext (reliable on mobile & iframe)
+    try {
+      const ctx = outputAudioCtxRef.current ?? createAudioContextSafe(24000);
+      outputAudioCtxRef.current = ctx;
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      if (ctx.state === 'running') {
+        const bytes = base64ToUint8Array(audioBase64);
+        const arrayBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+        const audioBuffer = await ctx.decodeAudioData(arrayBuf);
+        const src = ctx.createBufferSource();
+        src.buffer = audioBuffer;
+        src.connect(ctx.destination);
+        activeSourcesRef.current.add(src);
+        setAudioBlocked(false);
+        setIsAiSpeaking(true);
+        setStatusText('Nova AI يتحدث الآن...');
+        src.onended = () => {
+          activeSourcesRef.current.delete(src);
+          if (activeSourcesRef.current.size === 0) {
+            setIsAiSpeaking(false);
+            setStatusText('اضغط للتحدث مجددًا مع Nova AI');
+          }
+        };
+        src.start(0);
+        return;
+      }
+    } catch {
+      // Fallback to HTMLAudioElement below
+    }
+
+    // Secondary: HTML5 <audio>
+    try {
+      const audio = new Audio(`data:${mimeType};base64,${audioBase64}`);
+      htmlAudioRef.current = audio;
+      setIsAiSpeaking(true);
+      setStatusText('Nova AI يتحدث الآن...');
+      audio.onended = () => {
+        htmlAudioRef.current = null;
+        setIsAiSpeaking(false);
+        setStatusText('اضغط للتحدث مجددًا مع Nova AI');
+      };
+      audio.onerror = () => {
+        htmlAudioRef.current = null;
+        speakWithBrowserFallback(replyText);
+      };
+      await audio.play();
+      setAudioBlocked(false);
+    } catch {
+      setAudioBlocked(true);
+      setIsAiSpeaking(false);
+      speakWithBrowserFallback(replyText);
+    }
+  };
+
+  const cleanupLiveSocketOnly = () => {
     if (processorRef.current) {
       try {
         processorRef.current.disconnect();
@@ -130,6 +341,26 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
       }
       processorRef.current = null;
     }
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {
+        // ignore
+      }
+      wsRef.current = null;
+    }
+  };
+
+  const switchToTurnFallback = (message?: string) => {
+    cleanupLiveSocketOnly();
+    modeRef.current = 'turn-fallback';
+    setMode('turn-fallback');
+    setStatusText(message || 'اضغط «اضغط للتحدث الآن» وسيرد عليك Nova AI صوتيًا');
+  };
+
+  const cleanupAllAudio = () => {
+    stopPlaybackQueue();
+    cleanupLiveSocketOnly();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
@@ -148,14 +379,6 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     if (outputAudioCtxRef.current) {
       outputAudioCtxRef.current.close().catch(() => undefined);
       outputAudioCtxRef.current = null;
-    }
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch {
-        // ignore
-      }
-      wsRef.current = null;
     }
   };
 
@@ -194,12 +417,25 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     );
   };
 
-  const play24kChunk = (base64Audio: string) => {
-    const ctx = outputAudioCtxRef.current;
-    if (!ctx) return;
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => undefined);
+  const play24kChunk = async (base64Audio: string) => {
+    let ctx = outputAudioCtxRef.current;
+    if (!ctx) {
+      ctx = createAudioContextSafe(24000);
+      outputAudioCtxRef.current = ctx;
+      nextStartTimeRef.current = ctx.currentTime;
     }
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {
+        // ignore
+      }
+    }
+    if (ctx.state !== 'running') {
+      setAudioBlocked(true);
+      return;
+    }
+    setAudioBlocked(false);
 
     const float32 = base64ToFloat32From24kPCM(base64Audio);
     if (float32.length === 0) return;
@@ -252,12 +488,17 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
         }
         mediaStreamRef.current = stream;
 
-        const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const inputCtx = new AudioCtx({ sampleRate: 16000 });
-        const outputCtx = new AudioCtx({ sampleRate: 24000 });
+        const inputCtx = createAudioContextSafe(16000);
+        const outputCtx = createAudioContextSafe(24000);
         inputAudioCtxRef.current = inputCtx;
         outputAudioCtxRef.current = outputCtx;
         nextStartTimeRef.current = outputCtx.currentTime;
+
+        await inputCtx.resume().catch(() => undefined);
+        await outputCtx.resume().catch(() => undefined);
+        if (outputCtx.state === 'suspended') {
+          setAudioBlocked(true);
+        }
 
         const idToken = await user.getIdToken();
         if (cancelled) return;
@@ -283,15 +524,9 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
         let openedSuccessfully = false;
         fallbackTimer = setTimeout(() => {
           if (!openedSuccessfully && !cancelled) {
-            try {
-              ws.close();
-            } catch {
-              // ignore
-            }
-            setMode('turn-fallback');
-            setStatusText('اضغط مطولًا أو انقر للتحدث مع Nova AI صوتيًا');
+            switchToTurnFallback('اضغط للتحدث مع Nova AI صوتيًا');
           }
-        }, 6500);
+        }, 5500);
 
         ws.onmessage = (event) => {
           if (cancelled) return;
@@ -310,7 +545,10 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
               openedSuccessfully = true;
               if (fallbackTimer) clearTimeout(fallbackTimer);
               setMode('live');
-              setStatusText('أنا أستمع إليك الآن... تكلّم بحرية وسأرد عليك صوتيًا!');
+              setStatusText('أنا أستمع إليك الآن... تكلّم وسأرد عليك بصوتي!');
+
+              inputCtx.resume().catch(() => undefined);
+              outputCtx.resume().catch(() => undefined);
 
               const source = inputCtx.createMediaStreamSource(stream);
               const processor = inputCtx.createScriptProcessor(4096, 1, 1);
@@ -324,13 +562,12 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
               };
 
               source.connect(processor);
-              // Connect through zero-gain node to prevent local mic echo
               const silentGain = inputCtx.createGain();
               silentGain.gain.value = 0;
               processor.connect(silentGain);
               silentGain.connect(inputCtx.destination);
             } else if (msg.audio) {
-              play24kChunk(msg.audio);
+              play24kChunk(msg.audio).catch(() => undefined);
             } else if (msg.inputTranscript) {
               upsertDraftEntry('user', msg.inputTranscript);
             } else if (msg.outputTranscript) {
@@ -341,12 +578,8 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
             } else if (msg.turnComplete) {
               finalizeDraftIds();
             } else if (msg.error) {
-              if (!openedSuccessfully) {
-                setMode('turn-fallback');
-                setStatusText('اضغط للتحدث مع Nova AI صوتيًا');
-              } else {
-                setError(msg.error);
-              }
+              if (fallbackTimer) clearTimeout(fallbackTimer);
+              switchToTurnFallback('تم التحويل للمحادثة الصوتية التفاعلية — اضغط للتحدث');
             }
           } catch {
             // ignore
@@ -354,18 +587,16 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
         };
 
         ws.onerror = () => {
-          if (!openedSuccessfully && !cancelled) {
+          if (!cancelled) {
             if (fallbackTimer) clearTimeout(fallbackTimer);
-            setMode('turn-fallback');
-            setStatusText('اضغط للتحدث مع Nova AI صوتيًا');
+            switchToTurnFallback('اضغط للتحدث مع Nova AI صوتيًا');
           }
         };
 
         ws.onclose = () => {
-          if (!openedSuccessfully && !cancelled) {
+          if (!cancelled && modeRef.current !== 'turn-fallback') {
             if (fallbackTimer) clearTimeout(fallbackTimer);
-            setMode('turn-fallback');
-            setStatusText('اضغط للتحدث مع Nova AI صوتيًا');
+            switchToTurnFallback('اضغط للتحدث مع Nova AI صوتيًا');
           }
         };
       } catch {
@@ -387,12 +618,29 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceName]);
 
-  const startTurnRecording = () => {
-    if (!mediaStreamRef.current || isRecordingTurn || isProcessingTurn) return;
+  const startTurnRecording = async () => {
+    await unlockAudioContexts();
+    stopPlaybackQueue();
+    if (isRecordingTurn || isProcessingTurn) return;
+
+    if (!mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch {
+        setError('يرجى السماح بالوصول إلى الميكروفون من إعدادات المتصفح.');
+        return;
+      }
+    }
+
     setError(null);
     recordedChunksRef.current = [];
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
-    const recorder = new MediaRecorder(mediaStreamRef.current, { mimeType });
+
+    const preferredMime = pickSupportedRecorderMime();
+    const recorder = preferredMime
+      ? new MediaRecorder(mediaStreamRef.current, { mimeType: preferredMime })
+      : new MediaRecorder(mediaStreamRef.current);
     mediaRecorderRef.current = recorder;
 
     recorder.ondataavailable = (ev) => {
@@ -400,8 +648,13 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     };
 
     recorder.onstop = async () => {
-      const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-      if (blob.size < 400) return;
+      const actualMime = recorder.mimeType || preferredMime || 'audio/webm';
+      const blob = new Blob(recordedChunksRef.current, { type: actualMime });
+      if (blob.size < 400) {
+        setError('التسجيل قصير جدًا أو لم يتم التقاط صوت. تحدّث لمدة ثانية على الأقل ثم أوقف التسجيل.');
+        setStatusText('اضغط للتحدث مع Nova AI صوتيًا');
+        return;
+      }
 
       setIsProcessingTurn(true);
       setStatusText('Nova AI يستمع ويفكر في الرد...');
@@ -410,7 +663,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
         const reader = new FileReader();
         const dataUrl: string = await new Promise((resolve, reject) => {
           reader.onload = () => resolve(String(reader.result || ''));
-          reader.onerror = () => reject(new Error('تعذر قراءة الصوت'));
+          reader.onerror = () => reject(new Error('تعذر قراءة التسجيل الصوتي'));
           reader.readAsDataURL(blob);
         });
         const base64 = dataUrl.split(',')[1] || '';
@@ -425,20 +678,30 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
           },
           body: JSON.stringify({
             audioBase64: base64,
-            mimeType,
+            mimeType: actualMime,
             voiceName,
             customInstruction,
             history: entriesRef.current.slice(-6).map((e) => ({ role: e.role, content: e.text })),
           }),
         });
 
-        const data = (await res.json()) as {
+        const rawText = await res.text();
+        if (rawText.trimStart().startsWith('<')) {
+          throw new Error('انقطع الاتصال المؤقت بالخادم. يرجى المحاولة مرة أخرى.');
+        }
+
+        let data: {
           userTranscript?: string;
           replyText?: string;
           audioBase64?: string | null;
           mimeType?: string | null;
           error?: string;
         };
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          throw new Error('استجابة غير صالحة من الخادم.');
+        }
 
         if (!res.ok || !data.replyText) {
           throw new Error(data.error || 'تعذر معالجة الصوت');
@@ -448,27 +711,16 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
         if (data.userTranscript) {
           newTurns.push({ id: `u-${Date.now()}`, role: 'user', text: data.userTranscript });
         }
-        newTurns.push({ id: `a-${Date.now()}`, role: 'assistant', text: data.replyText });
+        newTurns.push({
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          text: data.replyText,
+          audioBase64: data.audioBase64,
+          mimeType: data.mimeType,
+        });
         setEntries((prev) => [...prev, ...newTurns]);
 
-        if (data.audioBase64 && data.mimeType) {
-          setIsAiSpeaking(true);
-          setStatusText('Nova AI يتحدث...');
-          const audio = new Audio(`data:${data.mimeType};base64,${data.audioBase64}`);
-          audio.onended = () => {
-            setIsAiSpeaking(false);
-            setStatusText('اضغط للتحدث مجددًا مع Nova AI');
-          };
-          audio.onerror = () => {
-            setIsAiSpeaking(false);
-            setStatusText('اضغط للتحدث مجددًا مع Nova AI');
-          };
-          await audio.play().catch(() => {
-            setIsAiSpeaking(false);
-          });
-        } else {
-          setStatusText('اضغط للتحدث مجددًا مع Nova AI');
-        }
+        await playReplyAudio(data.audioBase64, data.mimeType, data.replyText);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'تعذر إرسال الصوت');
         setStatusText('اضغط للتحدث مع Nova AI صوتيًا');
@@ -479,10 +731,11 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
 
     recorder.start();
     setIsRecordingTurn(true);
-    setStatusText('جاري التسجيل... تحدّث الآن ثم اضغط إيقاف');
+    setStatusText('جاري التسجيل... تحدّث الآن ثم اضغط «إيقاف وإرسال»');
   };
 
-  const stopTurnRecording = () => {
+  const stopTurnRecording = async () => {
+    await unlockAudioContexts();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
       setIsRecordingTurn(false);
@@ -506,6 +759,9 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
       role="dialog"
       aria-modal="true"
       aria-label="محادثة صوتية مباشرة مع Nova AI"
+      onPointerDown={() => {
+        unlockAudioContexts().catch(() => undefined);
+      }}
     >
       <div className="w-full max-w-lg rounded-3xl bg-white dark:bg-[#0B1020] border border-slate-200 dark:border-white/15 shadow-2xl overflow-hidden flex flex-col max-h-[90dvh]">
         {/* Header */}
@@ -520,18 +776,29 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
             </div>
           </div>
 
-          <select
-            value={voiceName}
-            onChange={(e) => setVoiceName(e.target.value as VoiceName)}
-            aria-label="اختيار نبرة الصوت"
-            className="rounded-xl bg-slate-100 dark:bg-[#070B18] border border-slate-200 dark:border-white/10 px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
-          >
-            {VOICE_OPTIONS.map((v) => (
-              <option key={v.id} value={v.id}>
-                {v.label}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-2">
+            {mode === 'live' && (
+              <button
+                type="button"
+                onClick={() => switchToTurnFallback('التسجيل اليدوي: اضغط للتحدث الآن وسيرد Nova AI بصوته')}
+                className="px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-[11px] font-semibold text-slate-700 dark:text-slate-200 cursor-pointer whitespace-nowrap"
+              >
+                وضع الضغط للتحدث
+              </button>
+            )}
+            <select
+              value={voiceName}
+              onChange={(e) => setVoiceName(e.target.value as VoiceName)}
+              aria-label="اختيار نبرة الصوت"
+              className="rounded-xl bg-slate-100 dark:bg-[#070B18] border border-slate-200 dark:border-white/10 px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
+            >
+              {VOICE_OPTIONS.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
         {/* Center Voice Orb */}
@@ -550,11 +817,25 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
             </div>
           </div>
 
-          <div className="space-y-1">
+          <div className="space-y-2">
             <div className="text-sm font-semibold text-slate-900 dark:text-white flex items-center justify-center gap-2">
               {isAiSpeaking && <Volume2 className="w-4 h-4 animate-pulse" style={{ color: 'var(--accent-primary)' }} />}
               <span>{statusText}</span>
             </div>
+
+            {audioBlocked && (
+              <button
+                type="button"
+                onClick={() => {
+                  unlockAudioContexts().catch(() => undefined);
+                }}
+                className="accent-btn inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-white text-xs font-semibold cursor-pointer"
+              >
+                <Volume2 className="w-3.5 h-3.5" />
+                <span>اضغط هنا لتفعيل صوت الرد</span>
+              </button>
+            )}
+
             {error && <p className="text-xs text-rose-500">{error}</p>}
           </div>
         </div>
@@ -570,16 +851,31 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
             entries.map((item) => (
               <div
                 key={item.id}
-                className={`rounded-xl px-3.5 py-2.5 text-xs sm:text-sm leading-relaxed ${
+                className={`rounded-xl px-3.5 py-2.5 text-xs sm:text-sm leading-relaxed flex items-start justify-between gap-2 ${
                   item.role === 'user'
                     ? 'bg-slate-100 dark:bg-[#121A33] text-slate-900 dark:text-slate-100'
                     : 'bg-white dark:bg-[#070B18] border border-slate-200 dark:border-white/10 text-slate-800 dark:text-slate-200'
                 }`}
               >
-                <span className="font-bold ml-1.5" style={{ color: 'var(--accent-text)' }}>
-                  {item.role === 'user' ? 'أنت:' : 'Nova AI:'}
-                </span>
-                <span>{item.text}</span>
+                <div>
+                  <span className="font-bold ml-1.5" style={{ color: 'var(--accent-text)' }}>
+                    {item.role === 'user' ? 'أنت:' : 'Nova AI:'}
+                  </span>
+                  <span>{item.text}</span>
+                </div>
+                {item.role === 'assistant' && item.text.trim().length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      playReplyAudio(item.audioBase64, item.mimeType, item.text).catch(() => undefined);
+                    }}
+                    aria-label="إعادة تشغيل الصوت"
+                    title="إعادة تشغيل الصوت"
+                    className="p-1.5 rounded-lg bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-700 dark:text-slate-200 shrink-0 cursor-pointer"
+                  >
+                    <Play className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
+                  </button>
+                )}
               </div>
             ))
           )}
@@ -609,7 +905,10 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
           ) : (
             <button
               type="button"
-              onClick={() => setIsMuted((prev) => !prev)}
+              onClick={() => {
+                unlockAudioContexts().catch(() => undefined);
+                setIsMuted((prev) => !prev);
+              }}
               className={`flex-1 inline-flex items-center justify-center gap-2 py-3 px-4 rounded-xl text-sm font-semibold cursor-pointer border transition-colors ${
                 isMuted
                   ? 'bg-amber-500/15 border-amber-500/40 text-amber-600 dark:text-amber-300'

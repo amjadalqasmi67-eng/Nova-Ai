@@ -237,6 +237,9 @@ export function ChatWorkspace({
     if (speakingMsgId === msgId) {
       ttsAudioRef.current?.pause();
       ttsAudioRef.current = null;
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
       setSpeakingMsgId(null);
       return;
     }
@@ -246,6 +249,34 @@ export function ChatWorkspace({
       ttsAudioRef.current = null;
       setSpeakingMsgId(null);
     }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    const speakWithBrowserFallback = (): boolean => {
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
+      const voices = window.speechSynthesis.getVoices();
+      const arabicVoice = voices.find((v) => v.lang.toLowerCase().startsWith('ar'));
+      if (!arabicVoice) return false;
+      const clean = content
+        .replace(/https?:\/\/\S+/g, ' ')
+        .replace(/[*#`>_~[\](){}|\\]/g, ' ')
+        .replace(/\bNova AI\b/gi, 'نوفا')
+        .replace(/%/g, ' بالمئة ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 1500);
+      if (!clean) return false;
+      const utterance = new SpeechSynthesisUtterance(clean);
+      utterance.voice = arabicVoice;
+      utterance.lang = arabicVoice.lang || 'ar-SA';
+      utterance.rate = 0.98;
+      utterance.onend = () => setSpeakingMsgId(null);
+      utterance.onerror = () => setSpeakingMsgId(null);
+      setSpeakingMsgId(msgId);
+      window.speechSynthesis.speak(utterance);
+      return true;
+    };
 
     setLoadingTtsId(msgId);
     try {
@@ -259,7 +290,11 @@ export function ChatWorkspace({
         },
         body: JSON.stringify({ text: content }),
       });
-      const data = (await res.json()) as { audioBase64?: string; mimeType?: string; error?: string };
+      const rawText = await res.text();
+      if (rawText.trimStart().startsWith('<')) {
+        throw new Error('تعذر تشغيل الصوت من الخادم');
+      }
+      const data = JSON.parse(rawText) as { audioBase64?: string; mimeType?: string; error?: string };
       if (!res.ok || !data.audioBase64 || !data.mimeType) {
         throw new Error(data.error || 'تعذر تشغيل الصوت');
       }
@@ -271,12 +306,16 @@ export function ChatWorkspace({
         ttsAudioRef.current = null;
       };
       audio.onerror = () => {
-        setSpeakingMsgId(null);
         ttsAudioRef.current = null;
+        if (!speakWithBrowserFallback()) {
+          setSpeakingMsgId(null);
+        }
       };
       await audio.play();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'تعذر قراءة الرد صوتيًا.');
+      if (!speakWithBrowserFallback()) {
+        setError(err instanceof Error ? err.message : 'تعذر قراءة الرد صوتيًا.');
+      }
     } finally {
       setLoadingTtsId(null);
     }

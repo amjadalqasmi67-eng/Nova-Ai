@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { PptxDeck, PptxVisualTheme, exportDeckToPptx } from '../lib/pptxBuilder';
 import { getOtpHeaders } from '../lib/otpSession';
+import { postNdjsonOrJson } from '../lib/ndjsonFetch';
 
 interface PresentationStudioProps {
   user: User;
@@ -39,6 +40,7 @@ export function PresentationStudio({
   const [visualTheme, setVisualTheme] = useState<PptxVisualTheme>('cosmos');
 
   const [generating, setGenerating] = useState(false);
+  const [statusText, setStatusText] = useState('');
   const [downloading, setDownloading] = useState(false);
   const [deck, setDeck] = useState<PptxDeck | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -57,30 +59,29 @@ export function PresentationStudio({
     if (!cleanTopic || generating) return;
 
     setGenerating(true);
+    setStatusText('جاري تخطيط وبناء شرائح PowerPoint...');
     setError(null);
     setSuccessMsg(null);
 
     try {
       const idToken = await user.getIdToken();
-      const response = await fetch('/api/nova/generate-pptx', {
-        method: 'POST',
+      const data = await postNdjsonOrJson<PptxDeck>('/api/nova/generate-pptx', {
         headers: {
-          'Content-Type': 'application/json',
           Authorization: `Bearer ${idToken}`,
           ...getOtpHeaders(),
         },
-        body: JSON.stringify({
+        body: {
           topic: cleanTopic,
           details: details.trim(),
           slideCount,
           audience,
           language,
-        }),
+        },
+        onStatus: (msg) => setStatusText(msg),
       });
 
-      const data = (await response.json()) as PptxDeck & { error?: string };
-      if (!response.ok || !Array.isArray(data.slides)) {
-        throw new Error(data.error || 'تعذر إنشاء العرض التقديمي حاليًا.');
+      if (!Array.isArray(data.slides)) {
+        throw new Error('تعذر إنشاء العرض التقديمي حاليًا.');
       }
 
       setDeck({
@@ -94,6 +95,7 @@ export function PresentationStudio({
       setError(err instanceof Error ? err.message : 'حدث خطأ أثناء إنشاء العرض التقديمي.');
     } finally {
       setGenerating(false);
+      setStatusText('');
     }
   };
 
@@ -263,7 +265,7 @@ export function PresentationStudio({
             className="accent-btn w-full inline-flex items-center justify-center gap-2 py-3 px-4 rounded-xl text-white text-sm font-semibold cursor-pointer disabled:opacity-50"
           >
             <Sparkles className="w-4 h-4" />
-            <span>{generating ? 'جاري تصميم وبناء الشرائح...' : 'إنشاء العرض التقديمي'}</span>
+            <span>{generating ? statusText || 'جاري تصميم وبناء الشرائح...' : 'إنشاء العرض التقديمي'}</span>
           </button>
         </form>
 

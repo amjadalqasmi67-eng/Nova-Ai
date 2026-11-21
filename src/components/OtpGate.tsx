@@ -145,7 +145,7 @@ export function OtpGate({
             أدخل رمز التأكيد المرسل لبريدك
           </h1>
           <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-            لحماية حسابك ومنع أي دخول غير مصرح به، أرسلنا رمزًا مكونًا من 6 أرقام إلى:
+            لحماية حسابك ومنع أي دخول غير مصرح به، أرسلنا رمزًا مكونًا من 6 أرقام (يُطلب مرة واحدة فقط عند تسجيل الدخول) إلى:
             <span dir="ltr" className="block font-mono font-semibold text-slate-900 dark:text-slate-200 mt-1">
               {emailMasked}
             </span>
