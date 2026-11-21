@@ -1,10 +1,17 @@
+import http from 'http';
+import type { IncomingMessage } from 'http';
+import crypto from 'crypto';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import nodemailer from 'nodemailer';
+import { GoogleGenAI, Modality, ThinkingLevel, Type } from '@google/genai';
+import type { LiveServerMessage } from '@google/genai';
+import { WebSocketServer } from 'ws';
+import type { WebSocket } from 'ws';
 
 dotenv.config();
 
@@ -158,6 +165,7 @@ type ChatAttempt = {
   model: string;
   thinkingLevel: ThinkingLevel;
   delayMs: number;
+  firstTokenTimeoutMs: number;
   inactivityTimeoutMs: number;
 };
 
@@ -171,60 +179,66 @@ function isComplexPrompt(contents: ChatContentTurn[]): boolean {
     .join(' ')
     .trim();
 
-  if (hasImage || text.length >= 130) {
+  if (hasImage || text.length >= 220) {
     return true;
   }
 
   const hardKeywords =
-    /(اشرح بالتفصيل|فسّر|برهن|أثبت|حلل|قارن|معادلة|خوارزمية|برمجة|كود|خطأ برمجي|مسألة|احسب|فيزياء|كيمياء|رياضيات|تفاضل|تكامل|منطق|فلسفة|اقتصاد|استنتاج|بنية|معمارية|خطة عمل|استراتيجية|لماذا|كيف يعمل|debug|prove|algorithm|architecture|analyze|calculus|equation|theorem)/i;
-  const symbolHint = /[{}=><^√∫∑]|```|\n/;
+    /(اشرح بالتفصيل|برهن|أثبت|معادلة|خوارزمية|خطأ برمجي|مسألة|تفاضل|تكامل|معمارية|debug|prove|algorithm|architecture|calculus|equation|theorem)/i;
+  const symbolHint = /[{}=^√∫∑]|```/;
 
   return hardKeywords.test(text) || symbolHint.test(text);
 }
 
-function buildChatAttempts(thinkingDepth: 'low' | 'high' | undefined, isComplex: boolean): ChatAttempt[] {
-  if (thinkingDepth === 'high') {
+function buildChatAttempts(thinkingDepth: 'low' | 'high' | undefined, hasImage = false): ChatAttempt[] {
+  if (hasImage) {
     return [
       {
         model: 'gemini-4-hydrogen',
-        thinkingLevel: ThinkingLevel.MEDIUM,
+        thinkingLevel: ThinkingLevel.LOW,
         delayMs: 0,
-        inactivityTimeoutMs: 55000,
+        firstTokenTimeoutMs: 16000,
+        inactivityTimeoutMs: 45000,
       },
       {
         model: 'gemini-3.1-flash-lite',
         thinkingLevel: ThinkingLevel.MEDIUM,
-        delayMs: 250,
-        inactivityTimeoutMs: 45000,
+        delayMs: 0,
+        firstTokenTimeoutMs: 14000,
+        inactivityTimeoutMs: 40000,
       },
       {
         model: 'gemini-4-hydrogen',
-        thinkingLevel: ThinkingLevel.LOW,
-        delayMs: 250,
-        inactivityTimeoutMs: 40000,
+        thinkingLevel: ThinkingLevel.MEDIUM,
+        delayMs: 0,
+        firstTokenTimeoutMs: 20000,
+        inactivityTimeoutMs: 45000,
       },
     ];
   }
 
-  if (isComplex) {
+  if (thinkingDepth === 'high') {
     return [
       {
         model: 'gemini-4-hydrogen',
         thinkingLevel: ThinkingLevel.LOW,
         delayMs: 0,
+        firstTokenTimeoutMs: 14000,
         inactivityTimeoutMs: 45000,
       },
       {
         model: 'gemini-3.1-flash-lite',
         thinkingLevel: ThinkingLevel.MEDIUM,
-        delayMs: 250,
-        inactivityTimeoutMs: 45000,
+        delayMs: 0,
+        firstTokenTimeoutMs: 12000,
+        inactivityTimeoutMs: 40000,
       },
       {
-        model: 'gemini-3.1-flash-lite',
-        thinkingLevel: ThinkingLevel.LOW,
-        delayMs: 250,
-        inactivityTimeoutMs: 35000,
+        model: 'gemini-4-hydrogen',
+        thinkingLevel: ThinkingLevel.MEDIUM,
+        delayMs: 0,
+        firstTokenTimeoutMs: 18000,
+        inactivityTimeoutMs: 45000,
       },
     ];
   }
@@ -234,19 +248,22 @@ function buildChatAttempts(thinkingDepth: 'low' | 'high' | undefined, isComplex:
       model: 'gemini-3.1-flash-lite',
       thinkingLevel: ThinkingLevel.MINIMAL,
       delayMs: 0,
+      firstTokenTimeoutMs: 9000,
       inactivityTimeoutMs: 30000,
     },
     {
       model: 'gemini-4-hydrogen',
       thinkingLevel: ThinkingLevel.LOW,
-      delayMs: 200,
-      inactivityTimeoutMs: 35000,
+      delayMs: 0,
+      firstTokenTimeoutMs: 14000,
+      inactivityTimeoutMs: 40000,
     },
     {
       model: 'gemini-3.1-flash-lite',
       thinkingLevel: ThinkingLevel.LOW,
-      delayMs: 200,
-      inactivityTimeoutMs: 30000,
+      delayMs: 0,
+      firstTokenTimeoutMs: 12000,
+      inactivityTimeoutMs: 35000,
     },
   ];
 }
@@ -271,10 +288,10 @@ async function generateChatReply(
   ai: GoogleGenAI,
   contents: ChatContentTurn[],
   systemInstruction: string,
-  thinkingDepth?: 'low' | 'high'
+  thinkingDepth?: 'low' | 'high',
+  hasImage = false
 ): Promise<{ text: string; finishReason?: string; modelUsed: string }> {
-  const complex = isComplexPrompt(contents);
-  const attempts = buildChatAttempts(thinkingDepth, complex);
+  const attempts = buildChatAttempts(thinkingDepth, hasImage);
 
   let lastError: unknown;
   for (const attempt of attempts) {
@@ -283,7 +300,10 @@ async function generateChatReply(
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('TimeoutError: Attempt exceeded limit')), attempt.inactivityTimeoutMs + 25000);
+    const timer = setTimeout(
+      () => controller.abort(new Error('TimeoutError: Attempt exceeded limit')),
+      attempt.inactivityTimeoutMs + 15000
+    );
 
     try {
       const response = await ai.models.generateContent({
@@ -322,9 +342,13 @@ async function generateChatReply(
 
 interface AuthedRequest extends Request {
   uid?: string;
+  userEmail?: string;
 }
 
-const authTokenCache = new Map<string, { uid: string; expiresAt: number }>();
+const OWNER_ADMIN_EMAIL = 'amjad.alqasmi67@gmail.com';
+const OTP_SIGNING_SECRET = process.env.OTP_SIGNING_SECRET?.trim() || crypto.randomBytes(32).toString('hex');
+
+const authTokenCache = new Map<string, { uid: string; email: string; expiresAt: number }>();
 
 function getJwtExpMs(token: string): number | null {
   try {
@@ -338,84 +362,660 @@ function getJwtExpMs(token: string): number | null {
   }
 }
 
+async function verifyFirebaseIdToken(idToken: string): Promise<{ uid: string; email: string } | null> {
+  if (!idToken || idToken.length < 50 || idToken.length > 4096) return null;
+  if (!/^[A-Za-z0-9_.\-]+$/.test(idToken) || idToken.split('.').length !== 3) return null;
+
+  const now = Date.now();
+  const cached = authTokenCache.get(idToken);
+  if (cached && cached.expiresAt > now) {
+    return { uid: cached.uid, email: cached.email };
+  }
+  if (cached) {
+    authTokenCache.delete(idToken);
+  }
+
+  if (!firebaseConfig?.apiKey) {
+    throw new Error('MISSING_FIREBASE_CONFIG');
+  }
+
+  const lookupRes = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken }),
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+
+  if (!lookupRes.ok) {
+    return null;
+  }
+
+  const data = (await lookupRes.json()) as {
+    users?: Array<{ localId?: string; email?: string; emailVerified?: boolean; disabled?: boolean }>;
+  };
+  const account = data.users?.[0];
+  const uid = account?.localId;
+  const email = account?.email?.trim() || '';
+  if (!uid || !email || account?.disabled === true || account?.emailVerified !== true) {
+    return null;
+  }
+
+  const jwtExpMs = getJwtExpMs(idToken);
+  const cacheUntil = jwtExpMs
+    ? Math.min(now + 5 * 60_000, jwtExpMs - 30_000)
+    : now + 5 * 60_000;
+
+  if (cacheUntil > now) {
+    if (authTokenCache.size >= 500) {
+      const oldestKey = authTokenCache.keys().next().value;
+      if (oldestKey) authTokenCache.delete(oldestKey);
+    }
+    authTokenCache.set(idToken, { uid, email, expiresAt: cacheUntil });
+  }
+
+  return { uid, email };
+}
+
+// --- Multi-Layer Security Firewall, Suspicious Activity Shield & Gmail OTP 2FA ---
+interface RateWindow {
+  timestamps: number[];
+  blockedUntil: number;
+}
+
+interface SecurityEventEntry {
+  id: string;
+  type:
+    | 'scanner_probe'
+    | 'traversal_block'
+    | 'csrf_origin_block'
+    | 'prototype_pollution_block'
+    | 'auth_ban'
+    | 'otp_lockout';
+  maskedIp: string;
+  path: string;
+  timestamp: number;
+}
+
+interface OtpChallengeRecord {
+  salt: string;
+  codeHash: string;
+  expiresAt: number;
+  lastSentAt: number;
+  failedAttempts: number;
+  lockedUntil: number;
+  requestHistory: number[];
+}
+
+const ipApiWindows = new Map<string, RateWindow>();
+const userAiWindows = new Map<string, RateWindow>();
+const authFailWindows = new Map<string, RateWindow>();
+const suspicionProbeWindows = new Map<string, RateWindow>();
+const wsActiveByIp = new Map<string, number>();
+const wsActiveByUid = new Map<string, number>();
+const otpChallenges = new Map<string, OtpChallengeRecord>();
+const securityEvents: SecurityEventEntry[] = [];
+
+setInterval(() => {
+  const now = Date.now();
+  const cutoff = now - 15 * 60_000;
+  for (const store of [ipApiWindows, userAiWindows, authFailWindows, suspicionProbeWindows]) {
+    for (const [key, entry] of store.entries()) {
+      entry.timestamps = entry.timestamps.filter((t) => t > cutoff);
+      if (entry.timestamps.length === 0 && entry.blockedUntil < now) {
+        store.delete(key);
+      }
+    }
+  }
+  for (const [uid, rec] of otpChallenges.entries()) {
+    if (rec.expiresAt < now && rec.lockedUntil < now) {
+      otpChallenges.delete(uid);
+    }
+  }
+}, 5 * 60_000).unref();
+
+function getClientIp(req: IncomingMessage): string {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim().length > 0) {
+    return xff.split(',')[0].trim();
+  }
+  if (Array.isArray(xff) && xff.length > 0) {
+    return xff[0].split(',')[0].trim();
+  }
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function maskIpForLog(ip: string): string {
+  if (!ip || ip === 'unknown') return 'unknown';
+  if (ip.includes('.')) {
+    const parts = ip.split('.');
+    return parts.length === 4 ? `${parts[0]}.${parts[1]}.x.x` : 'ipv4-masked';
+  }
+  return `${ip.slice(0, 8)}:xxxx`;
+}
+
+function recordSecurityEvent(type: SecurityEventEntry['type'], ip: string, reqPath: string): void {
+  securityEvents.unshift({
+    id: crypto.randomUUID(),
+    type,
+    maskedIp: maskIpForLog(ip),
+    path: String(reqPath || '/').slice(0, 120),
+    timestamp: Date.now(),
+  });
+  if (securityEvents.length > 100) {
+    securityEvents.length = 100;
+  }
+}
+
+function consumeRateQuota(
+  store: Map<string, RateWindow>,
+  key: string,
+  limit: number,
+  windowMs: number,
+  banMs = 0
+): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  let entry = store.get(key);
+  if (!entry) {
+    entry = { timestamps: [], blockedUntil: 0 };
+    store.set(key, entry);
+  }
+  if (entry.blockedUntil > now) {
+    return { allowed: false, retryAfterSec: Math.ceil((entry.blockedUntil - now) / 1000) };
+  }
+  entry.timestamps = entry.timestamps.filter((t) => now - t < windowMs);
+  if (entry.timestamps.length >= limit) {
+    if (banMs > 0) {
+      entry.blockedUntil = now + banMs;
+    }
+    const oldest = entry.timestamps[0] ?? now;
+    const waitMs = banMs > 0 ? banMs : Math.max(1000, windowMs - (now - oldest));
+    return { allowed: false, retryAfterSec: Math.ceil(waitMs / 1000) };
+  }
+  entry.timestamps.push(now);
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function recordAuthFailure(ip: string, reqPath = '/api'): boolean {
+  const now = Date.now();
+  let entry = authFailWindows.get(ip);
+  if (!entry) {
+    entry = { timestamps: [], blockedUntil: 0 };
+    authFailWindows.set(ip, entry);
+  }
+  entry.timestamps = entry.timestamps.filter((t) => now - t < 5 * 60_000);
+  entry.timestamps.push(now);
+  if (entry.timestamps.length >= 15) {
+    entry.blockedUntil = now + 5 * 60_000;
+    recordSecurityEvent('auth_ban', ip, reqPath);
+    return true;
+  }
+  return false;
+}
+
+function recordSuspiciousProbe(ip: string, reqPath: string): void {
+  recordSecurityEvent('scanner_probe', ip, reqPath);
+  const now = Date.now();
+  let entry = suspicionProbeWindows.get(ip);
+  if (!entry) {
+    entry = { timestamps: [], blockedUntil: 0 };
+    suspicionProbeWindows.set(ip, entry);
+  }
+  entry.timestamps = entry.timestamps.filter((t) => now - t < 10 * 60_000);
+  entry.timestamps.push(now);
+  if (entry.timestamps.length >= 3) {
+    entry.blockedUntil = now + 15 * 60_000;
+  }
+}
+
+function isIpTemporarilyBanned(ip: string): number {
+  const now = Date.now();
+  const authEntry = authFailWindows.get(ip);
+  const probeEntry = suspicionProbeWindows.get(ip);
+  const authRem = authEntry ? authEntry.blockedUntil - now : 0;
+  const probeRem = probeEntry ? probeEntry.blockedUntil - now : 0;
+  const maxRem = Math.max(authRem, probeRem);
+  return maxRem > 0 ? Math.ceil(maxRem / 1000) : 0;
+}
+
+function countActiveBannedIps(): number {
+  const now = Date.now();
+  const ips = new Set<string>();
+  for (const [ip, entry] of authFailWindows.entries()) {
+    if (entry.blockedUntil > now) ips.add(ip);
+  }
+  for (const [ip, entry] of suspicionProbeWindows.entries()) {
+    if (entry.blockedUntil > now) ips.add(ip);
+  }
+  return ips.size;
+}
+
+function isTrustedRequestOrigin(headers: IncomingMessage['headers']): boolean {
+  const originRaw = typeof headers.origin === 'string' ? headers.origin : '';
+  const refererRaw = typeof headers.referer === 'string' ? headers.referer : '';
+  const sourceUrl = originRaw || refererRaw;
+  if (!sourceUrl) {
+    return true;
+  }
+  try {
+    const parsedSource = new URL(sourceUrl);
+    if (parsedSource.protocol !== 'https:' && parsedSource.protocol !== 'http:') {
+      return false;
+    }
+    const forwardedHost = typeof headers['x-forwarded-host'] === 'string' ? headers['x-forwarded-host'] : '';
+    const hostHeader = (forwardedHost || headers.host || '').split(',')[0].trim().toLowerCase();
+    if (!hostHeader) return false;
+    const sourceHost = parsedSource.host.toLowerCase();
+    if (sourceHost === hostHeader) return true;
+    const sourceHostname = parsedSource.hostname.toLowerCase();
+    const expectedHostname = hostHeader.split(':')[0];
+    if (
+      process.env.NODE_ENV !== 'production' &&
+      (sourceHostname === 'localhost' || sourceHostname === '127.0.0.1') &&
+      (expectedHostname === 'localhost' || expectedHostname === '127.0.0.1')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function hasDangerousKeysOrDepth(value: unknown, depth = 0): boolean {
+  if (depth > 12) return true;
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) {
+    if (value.length > 500) return true;
+    for (const item of value) {
+      if (hasDangerousKeysOrDepth(item, depth + 1)) return true;
+    }
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length > 100) return true;
+  for (const key of keys) {
+    if (DANGEROUS_KEYS.has(key)) return true;
+    if (hasDangerousKeysOrDepth(obj[key], depth + 1)) return true;
+  }
+  return false;
+}
+
+function isSuspiciousUrlPath(rawUrl: string): boolean {
+  if (!rawUrl || rawUrl.includes('\0') || /%00/i.test(rawUrl)) return true;
+  if (/(\.\.[\\/]|%2e%2e[\\/]|%2e%2e%2f|%2e%2e%5c)/i.test(rawUrl)) return true;
+  try {
+    const decoded = decodeURIComponent(rawUrl);
+    if (decoded.includes('\0') || decoded.includes('../') || decoded.includes('..\\')) {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+const SUSPICIOUS_PROBE_PATH_RE =
+  /^\/(\.env|\.git|\.svn|\.hg|\.htaccess|\.DS_Store|wp-admin|wp-login|wp-content|phpmyadmin|pma|adminer|xmlrpc\.php|actuator|cgi-bin|server-status|config\.php)/i;
+const SUSPICIOUS_QUERY_RE = /(\bunion\s+select\b|\bdrop\s+table\b|<script\b|javascript:|onerror\s*=|onload\s*=)/i;
+const SCANNER_UA_RE = /(sqlmap|nikto|nmap|masscan|dirbuster|gobuster|wpscan|nuclei|acunetix|nessus|zgrab)/i;
+
+function isSuspiciousProbeOrBot(req: IncomingMessage): boolean {
+  const url = req.url || '/';
+  const pathname = url.split('?')[0] || '/';
+  let decodedUrl = url;
+  try {
+    decodedUrl = decodeURIComponent(url.replace(/\+/g, ' '));
+  } catch {
+    decodedUrl = url.replace(/\+/g, ' ');
+  }
+  const ua = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+  if (SUSPICIOUS_PROBE_PATH_RE.test(pathname)) return true;
+  if (SUSPICIOUS_QUERY_RE.test(url) || SUSPICIOUS_QUERY_RE.test(decodedUrl)) return true;
+  if (SCANNER_UA_RE.test(ua)) return true;
+  return false;
+}
+
+// --- Gmail / Email OTP 2FA Helpers ---
+function extractValidFromAddress(raw: string | undefined): string | null {
+  const val = (raw || '').trim();
+  if (!val || val.length > 160 || /[;\n\r{}]/.test(val)) return null;
+  const angleMatch = val.match(/^([^<>]{1,80})<\s*([^\s<>@;]+@[^\s<>@;]+\.[^\s<>@;]+)\s*>$/);
+  if (angleMatch) {
+    return `${angleMatch[1].trim()} <${angleMatch[2].trim()}>`;
+  }
+  if (/^[^\s<>@;]+@[^\s<>@;]+\.[^\s<>@;]+$/.test(val)) {
+    return `Nova AI <${val}>`;
+  }
+  return null;
+}
+
+function getValidResendKey(): string | null {
+  const raw = (process.env.RESEND_API_KEY || '').trim();
+  if (!raw || /\s/.test(raw) || !raw.startsWith('re_') || raw.length < 16) return null;
+  return raw;
+}
+
+function getValidSmtpConfig(): { host: string; port: number; user: string; pass: string } | null {
+  const user = (process.env.SMTP_USER || '').trim();
+  const pass = (process.env.SMTP_PASS || '').trim();
+  if (!/^[^\s<>@;]+@[^\s<>@;]+\.[^\s<>@;]+$/.test(user)) return null;
+  if (!pass || /[;{}<>()\n\r]/.test(pass) || pass.length > 128) return null;
+  const rawHost = (process.env.SMTP_HOST || '').trim();
+  const host = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(rawHost) ? rawHost : 'smtp.gmail.com';
+  const parsedPort = Number((process.env.SMTP_PORT || '').trim());
+  const port = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? parsedPort : 465;
+  return { host, port, user, pass };
+}
+
+function isOtpDeliveryConfigured(): boolean {
+  return Boolean(getValidResendKey() || getValidSmtpConfig());
+}
+
+function maskEmailAddress(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!local || !domain) return email;
+  const visible = local.length <= 2 ? local[0] || '*' : local.slice(0, 2);
+  return `${visible}***@${domain}`;
+}
+
+function computeUaHash(headers: IncomingMessage['headers']): string {
+  const ua = typeof headers['user-agent'] === 'string' ? headers['user-agent'] : '';
+  return crypto.createHash('sha256').update(ua).digest('hex').slice(0, 16);
+}
+
+function hashOtpCode(uid: string, salt: string, code: string): string {
+  return crypto.createHmac('sha256', OTP_SIGNING_SECRET).update(`${uid}:${salt}:${code}`).digest('hex');
+}
+
+function issueOtpSessionToken(uid: string, uaHash: string): { token: string; expiresAt: number } {
+  const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
+  const payload = Buffer.from(JSON.stringify({ uid, uaHash, exp: expiresAt }), 'utf-8').toString('base64url');
+  const sig = crypto.createHmac('sha256', OTP_SIGNING_SECRET).update(payload).digest('base64url');
+  return { token: `${payload}.${sig}`, expiresAt };
+}
+
+function verifyOtpSessionToken(token: string | undefined, uid: string, uaHash: string): boolean {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return false;
+  const [payloadB64, sigB64] = token.split('.');
+  if (!payloadB64 || !sigB64) return false;
+  const expectedSig = crypto.createHmac('sha256', OTP_SIGNING_SECRET).update(payloadB64).digest('base64url');
+  const sigBuf = Buffer.from(sigB64, 'utf-8');
+  const expectedBuf = Buffer.from(expectedSig, 'utf-8');
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8')) as {
+      uid?: string;
+      uaHash?: string;
+      exp?: number;
+    };
+    if (parsed.uid !== uid || parsed.uaHash !== uaHash) return false;
+    if (typeof parsed.exp !== 'number' || parsed.exp < Date.now()) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendOtpEmail(toEmail: string, code: string): Promise<void> {
+  const subject = `رمز التحقق من Nova AI: ${code}`;
+  const html = `
+    <div dir="rtl" style="font-family: Arial, Tahoma, sans-serif; max-width: 520px; margin: 0 auto; background-color: #ffffff; color: #0f172a; padding: 28px; border-radius: 16px; border: 1px solid #e2e8f0;">
+      <h2 style="margin: 0 0 12px; color: #4f46e5; font-size: 20px;">Nova AI — رمز التحقق الأمني</h2>
+      <p style="margin: 0 0 18px; color: #334155; font-size: 15px; line-height: 1.7;">
+        مرحبًا، لإكمال تسجيل الدخول إلى حسابك في Nova AI بأمان، أدخل رمز التحقق التالي:
+      </p>
+      <div style="background-color: #f1f5f9; border: 2px solid #4f46e5; border-radius: 12px; padding: 20px; text-align: center; font-family: 'Courier New', monospace; font-size: 34px; letter-spacing: 8px; font-weight: 800; color: #0f172a; direction: ltr;">
+        ${code}
+      </div>
+      <p style="margin: 18px 0 0; font-size: 13px; color: #475569; line-height: 1.6;">
+        الرمز هو: <strong dir="ltr" style="color: #0f172a;">${code}</strong> (صالح لمدة 5 دقائق فقط). لا تشارك هذا الرمز مع أي شخص.
+      </p>
+    </div>
+  `;
+  const text = `رمز التحقق لتسجيل الدخول في Nova AI هو: ${code}\nصالح لمدة 5 دقائق فقط. لا تشارك هذا الرمز مع أي شخص.`;
+
+  const resendKey = getValidResendKey();
+  const smtpCfg = getValidSmtpConfig();
+  const validCustomFrom = extractValidFromAddress(process.env.SMTP_FROM);
+
+  if (resendKey) {
+    const primaryFrom = validCustomFrom || 'Nova AI <onboarding@resend.dev>';
+    const sendViaResend = async (fromAddr: string) =>
+      fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${resendKey}`,
+        },
+        body: JSON.stringify({
+          from: fromAddr,
+          to: [toEmail],
+          subject,
+          html,
+          text,
+        }),
+        signal: AbortSignal.timeout(12000),
+      });
+
+    let res = await sendViaResend(primaryFrom);
+    if (!res.ok && primaryFrom !== 'Nova AI <onboarding@resend.dev>') {
+      res = await sendViaResend('Nova AI <onboarding@resend.dev>');
+    }
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`RESEND_FAILED:${res.status}:${errBody.slice(0, 200)}`);
+    }
+    return;
+  }
+
+  if (smtpCfg) {
+    const fromAddress = validCustomFrom || `Nova AI <${smtpCfg.user}>`;
+    const transporter = nodemailer.createTransport({
+      host: smtpCfg.host,
+      port: smtpCfg.port,
+      secure: smtpCfg.port === 465,
+      auth: {
+        user: smtpCfg.user,
+        pass: smtpCfg.pass,
+      },
+    });
+    await transporter.sendMail({
+      from: fromAddress,
+      to: toEmail,
+      subject,
+      text,
+      html,
+    });
+    return;
+  }
+
+  throw new Error('OTP_EMAIL_PROVIDER_NOT_CONFIGURED');
+}
+
 async function requireFirebaseAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  const ip = getClientIp(req);
+  const banSec = isIpTemporarilyBanned(ip);
+  if (banSec > 0) {
+    res.setHeader('Retry-After', String(banSec));
+    res.status(429).json({
+      error: `تم حظر الطلبات مؤقتًا للحماية الأمنية بعد محاولات فاشلة متكررة. حاول مجددًا بعد ${banSec} ثانية.`,
+    });
+    return;
+  }
+
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      recordAuthFailure(ip, req.originalUrl);
       res.status(401).json({ error: 'يجب تسجيل الدخول أولاً للوصول إلى خدمات Nova AI.' });
       return;
     }
 
     const idToken = authHeader.slice('Bearer '.length).trim();
     if (!idToken) {
+      recordAuthFailure(ip, req.originalUrl);
       res.status(401).json({ error: 'رمز التحقق غير صالح.' });
       return;
     }
 
-    const now = Date.now();
-    const cached = authTokenCache.get(idToken);
-    if (cached && cached.expiresAt > now) {
-      req.uid = cached.uid;
-      next();
-      return;
-    }
-    if (cached) {
-      authTokenCache.delete(idToken);
-    }
-
-    if (!firebaseConfig?.apiKey) {
-      res.status(500).json({ error: 'إعدادات المصادقة غير مكتملة على الخادم.' });
-      return;
-    }
-
-    const lookupRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idToken }),
-        signal: AbortSignal.timeout(10000),
-      }
-    );
-
-    if (!lookupRes.ok) {
+    const verified = await verifyFirebaseIdToken(idToken);
+    if (!verified) {
+      recordAuthFailure(ip, req.originalUrl);
       res.status(401).json({ error: 'انتهت صلاحية الجلسة أو تعذر التحقق من الهوية. يرجى إعادة تسجيل الدخول.' });
       return;
     }
 
-    const data = (await lookupRes.json()) as { users?: Array<{ localId?: string }> };
-    const user = data.users?.[0];
-    if (!user?.localId) {
-      res.status(401).json({ error: 'تعذر التحقق من هوية المستخدم.' });
+    const aiQuota = consumeRateQuota(userAiWindows, `${verified.uid}:${ip}`, 25, 60_000);
+    if (!aiQuota.allowed) {
+      res.setHeader('Retry-After', String(aiQuota.retryAfterSec));
+      res.status(429).json({
+        error: `تم تجاوز حد الطلبات السريع لحماية الخدمة. يرجى الانتظار ${aiQuota.retryAfterSec} ثانية.`,
+      });
       return;
     }
 
-    const jwtExpMs = getJwtExpMs(idToken);
-    const cacheUntil = jwtExpMs
-      ? Math.min(now + 5 * 60_000, jwtExpMs - 30_000)
-      : now + 5 * 60_000;
-
-    if (cacheUntil > now) {
-      if (authTokenCache.size >= 500) {
-        const oldestKey = authTokenCache.keys().next().value;
-        if (oldestKey) authTokenCache.delete(oldestKey);
-      }
-      authTokenCache.set(idToken, { uid: user.localId, expiresAt: cacheUntil });
-    }
-
-    req.uid = user.localId;
+    req.uid = verified.uid;
+    req.userEmail = verified.email;
     next();
   } catch (err) {
+    if (err instanceof Error && err.message === 'MISSING_FIREBASE_CONFIG') {
+      res.status(500).json({ error: 'إعدادات المصادقة غير مكتملة على الخادم.' });
+      return;
+    }
+    recordAuthFailure(ip, req.originalUrl);
     console.error('Auth verification error:', err);
     res.status(401).json({ error: 'فشل التحقق من جلسة المستخدم.' });
   }
 }
 
+function requireOtpIfConfigured(req: AuthedRequest, res: Response, next: NextFunction) {
+  if (!isOtpDeliveryConfigured()) {
+    next();
+    return;
+  }
+  const otpToken = typeof req.headers['x-nova-otp-token'] === 'string' ? req.headers['x-nova-otp-token'].trim() : '';
+  const uaHash = computeUaHash(req.headers);
+  if (!req.uid || !verifyOtpSessionToken(otpToken, req.uid, uaHash)) {
+    res.status(403).json({
+      requiresOtp: true,
+      error: 'يجب إتمام التحقق برمز Gmail أولاً قبل استخدام خدمات Nova AI.',
+    });
+    return;
+  }
+  next();
+}
+
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '25mb' }));
-  app.use('/api', (_req, res, next) => {
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  // Block path traversal, null-byte, scanner probes & banned IPs before any handler
+  app.use((req, res, next) => {
+    const ip = getClientIp(req);
+    const banSec = isIpTemporarilyBanned(ip);
+    if (banSec > 0) {
+      res.setHeader('Retry-After', String(banSec));
+      res.status(429).json({ error: 'تم حظر هذا العنوان مؤقتًا بسبب نشاط مشبوه.' });
+      return;
+    }
+    if (isSuspiciousUrlPath(req.originalUrl)) {
+      recordSecurityEvent('traversal_block', ip, req.originalUrl);
+      res.status(400).json({ error: 'طلب مرفوض بواسطة جدار الحماية.' });
+      return;
+    }
+    if (isSuspiciousProbeOrBot(req)) {
+      recordSuspiciousProbe(ip, req.originalUrl);
+      res.status(403).json({ error: 'تم حظر هذا النشاط المشبوه بواسطة جدار الحماية.' });
+      return;
+    }
+    next();
+  });
+
+  // Enforce HTTPS in production and apply multi-layered transport, CSP & browser isolation headers
+  const isProd = process.env.NODE_ENV === 'production';
+  const cspScriptSrc = isProd
+    ? "'self' https://apis.google.com https://accounts.google.com"
+    : "'self' 'unsafe-inline' https://apis.google.com https://accounts.google.com";
+  const cspHeader = [
+    "default-src 'self'",
+    `script-src ${cspScriptSrc}`,
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob: https://*.googleusercontent.com https://lh3.googleusercontent.com",
+    "media-src 'self' data: blob:",
+    "connect-src 'self' wss: ws: https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firestore.googleapis.com https://fonts.googleapis.com https://fonts.gstatic.com",
+    "frame-src 'self' https://accounts.google.com https://*.firebaseapp.com",
+    "frame-ancestors 'self' https://aistudio.google.com https://*.aistudio.google.com https://*.google.com",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    'upgrade-insecure-requests',
+  ].join('; ');
+
+  app.use((req, res, next) => {
+    const proto = req.headers['x-forwarded-proto'];
+    if (isProd && proto === 'http' && req.headers.host) {
+      res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+      return;
+    }
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(), payment=(), usb=()');
+    res.setHeader('Content-Security-Policy', cspHeader);
+    next();
+  });
+
+  app.use(express.json({ limit: '16mb' }));
+
+  // API Firewall: rate limiting, same-origin CSRF enforcement, Content-Type & prototype pollution checks
+  app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
+    const ip = getClientIp(req);
+    const banSec = isIpTemporarilyBanned(ip);
+    if (banSec > 0) {
+      res.setHeader('Retry-After', String(banSec));
+      res.status(429).json({ error: 'تم تقييد الوصول مؤقتًا للحماية الأمنية.' });
+      return;
+    }
+
+    const ipQuota = consumeRateQuota(ipApiWindows, ip, 90, 60_000);
+    if (!ipQuota.allowed) {
+      res.setHeader('Retry-After', String(ipQuota.retryAfterSec));
+      res.status(429).json({ error: 'عدد الطلبات مرتفع جدًا من هذا العنوان. يرجى الانتظار قليلاً.' });
+      return;
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
+      if (!isTrustedRequestOrigin(req.headers)) {
+        recordSecurityEvent('csrf_origin_block', ip, req.originalUrl);
+        res.status(403).json({ error: 'تم رفض الطلب لعدم تطابق المصدر الأمني.' });
+        return;
+      }
+      const contentType = req.headers['content-type'] || '';
+      if (!contentType.toLowerCase().includes('application/json')) {
+        res.status(415).json({ error: 'نوع المحتوى غير مدعوم. يجب إرسال البيانات بصيغة JSON.' });
+        return;
+      }
+      if (hasDangerousKeysOrDepth(req.body)) {
+        recordSecurityEvent('prototype_pollution_block', ip, req.originalUrl);
+        res.status(400).json({ error: 'تم حظر البيانات لاحتوائها على حقول أو بنية غير آمنة.' });
+        return;
+      }
+    }
     next();
   });
 
@@ -424,8 +1024,185 @@ async function startServer() {
       ok: true,
       service: 'Nova AI',
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      otpConfigured: isOtpDeliveryConfigured(),
     });
   });
+
+  // --- Email OTP Verification Endpoints & Owner Security Monitor ---
+  app.get('/api/auth/otp/status', requireFirebaseAuth, (req: AuthedRequest, res: Response) => {
+    const configured = isOtpDeliveryConfigured();
+    if (!configured) {
+      res.json({
+        otpRequired: false,
+        configured: false,
+        verified: true,
+        emailMasked: req.userEmail ? maskEmailAddress(req.userEmail) : '',
+        cooldownRemainingSec: 0,
+      });
+      return;
+    }
+    const token = typeof req.headers['x-nova-otp-token'] === 'string' ? req.headers['x-nova-otp-token'].trim() : '';
+    const uaHash = computeUaHash(req.headers);
+    const verified = Boolean(req.uid && verifyOtpSessionToken(token, req.uid, uaHash));
+    const existingChallenge = req.uid ? otpChallenges.get(req.uid) : undefined;
+    const cooldownRemainingSec = existingChallenge
+      ? Math.max(0, Math.ceil((existingChallenge.lastSentAt + 60_000 - Date.now()) / 1000))
+      : 0;
+    res.json({
+      otpRequired: !verified,
+      configured: true,
+      verified,
+      emailMasked: req.userEmail ? maskEmailAddress(req.userEmail) : '',
+      cooldownRemainingSec,
+    });
+  });
+
+  app.post('/api/auth/otp/request', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+    try {
+      if (!isOtpDeliveryConfigured()) {
+        res.json({ alreadyVerified: true, sent: false });
+        return;
+      }
+      if (!req.uid || !req.userEmail) {
+        res.status(401).json({ error: 'تعذر التحقق من البريد الإلكتروني.' });
+        return;
+      }
+
+      const now = Date.now();
+      const prev = otpChallenges.get(req.uid);
+      if (prev && prev.lockedUntil > now) {
+        const waitSec = Math.ceil((prev.lockedUntil - now) / 1000);
+        res.status(429).json({
+          cooldownSec: waitSec,
+          error: `تم قفل طلبات الرمز مؤقتًا للحماية. انتظر ${waitSec} ثانية.`,
+        });
+        return;
+      }
+      if (prev && now - prev.lastSentAt < 60_000) {
+        const cooldownSec = Math.ceil((prev.lastSentAt + 60_000 - now) / 1000);
+        res.status(429).json({
+          cooldownSec,
+          error: `يرجى الانتظار ${cooldownSec} ثانية قبل طلب رمز جديد.`,
+        });
+        return;
+      }
+
+      const history = (prev?.requestHistory || []).filter((t) => now - t < 60 * 60_000);
+      if (history.length >= 5) {
+        res.status(429).json({
+          cooldownSec: 300,
+          error: 'تم تجاوز الحد الأقصى لطلب رموز التحقق في الساعة. حاول لاحقًا.',
+        });
+        return;
+      }
+
+      const code = String(crypto.randomInt(100000, 1000000));
+      const salt = crypto.randomBytes(16).toString('hex');
+      const codeHash = hashOtpCode(req.uid, salt, code);
+
+      await sendOtpEmail(req.userEmail, code);
+
+      otpChallenges.set(req.uid, {
+        salt,
+        codeHash,
+        expiresAt: now + 5 * 60_000,
+        lastSentAt: now,
+        failedAttempts: 0,
+        lockedUntil: 0,
+        requestHistory: [...history, now],
+      });
+
+      res.json({
+        sent: true,
+        emailMasked: maskEmailAddress(req.userEmail),
+        cooldownSec: 60,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      console.error('[Nova AI OTP Send Error]:', msg);
+      if (msg.includes('RESEND_FAILED:403') || msg.includes('only send testing emails')) {
+        res.status(502).json({
+          error:
+            'حساب Resend المجاني يسمح بالإرسال فقط إلى البريد المسجل به في Resend حتى توثيق النطاق (أو استخدم SMTP_USER و SMTP_PASS مع كلمة مرور تطبيق Gmail لإرسال الرمز لأي بريد).',
+        });
+        return;
+      }
+      res.status(502).json({ error: 'تعذر إرسال رسالة الرمز إلى Gmail حاليًا. تحقق من إعدادات البريد في الخادم.' });
+    }
+  });
+
+  app.post('/api/auth/otp/verify', requireFirebaseAuth, (req: AuthedRequest, res: Response) => {
+    const ip = getClientIp(req);
+    if (!isOtpDeliveryConfigured()) {
+      const uaHash = computeUaHash(req.headers);
+      const issued = req.uid ? issueOtpSessionToken(req.uid, uaHash) : null;
+      res.json({ verified: true, otpToken: issued?.token || 'disabled', expiresAt: issued?.expiresAt || 0 });
+      return;
+    }
+
+    if (!req.uid) {
+      res.status(401).json({ error: 'جلسة غير صالحة.' });
+      return;
+    }
+
+    const code = typeof req.body?.code === 'string' ? req.body.code.replace(/\D/g, '') : '';
+    if (code.length !== 6) {
+      res.status(400).json({ error: 'يجب إدخال رمز مكون من 6 أرقام.' });
+      return;
+    }
+
+    const challenge = otpChallenges.get(req.uid);
+    const now = Date.now();
+    if (!challenge) {
+      res.status(400).json({ error: 'لا يوجد رمز تحقق نشط. اضغط على إعادة إرسال الرمز.' });
+      return;
+    }
+    if (challenge.lockedUntil > now) {
+      const waitSec = Math.ceil((challenge.lockedUntil - now) / 1000);
+      res.status(429).json({ error: `محاولات خاطئة متكررة. حاول مجددًا بعد ${waitSec} ثانية.` });
+      return;
+    }
+    if (challenge.expiresAt < now) {
+      otpChallenges.delete(req.uid);
+      res.status(400).json({ error: 'انتهت صلاحية الرمز. اطلب رمزًا جديدًا.' });
+      return;
+    }
+
+    const candidateHash = hashOtpCode(req.uid, challenge.salt, code);
+    const a = Buffer.from(candidateHash, 'hex');
+    const b = Buffer.from(challenge.codeHash, 'hex');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      challenge.failedAttempts += 1;
+      if (challenge.failedAttempts >= 5) {
+        challenge.lockedUntil = now + 10 * 60_000;
+        recordSecurityEvent('otp_lockout', ip, req.originalUrl);
+        res.status(429).json({ error: 'تم إدخال الرمز بشكل خاطئ 5 مرات. تم قفل التحقق لمدة 10 دقائق.' });
+        return;
+      }
+      res.status(401).json({ error: `رمز التحقق غير صحيح (المتبقي ${5 - challenge.failedAttempts} محاولات).` });
+      return;
+    }
+
+    otpChallenges.delete(req.uid);
+    const uaHash = computeUaHash(req.headers);
+    const issued = issueOtpSessionToken(req.uid, uaHash);
+    res.json({ verified: true, otpToken: issued.token, expiresAt: issued.expiresAt });
+  });
+
+  app.get('/api/owner/security-events', requireFirebaseAuth, (req: AuthedRequest, res: Response) => {
+    if ((req.userEmail || '').toLowerCase() !== OWNER_ADMIN_EMAIL) {
+      res.status(403).json({ error: 'هذه الصلاحية مخصصة لمالك الموقع فقط.' });
+      return;
+    }
+    res.json({
+      otpConfigured: isOtpDeliveryConfigured(),
+      activeBannedIps: countActiveBannedIps(),
+      totalBlockedEvents: securityEvents.length,
+      recentEvents: securityEvents.slice(0, 25),
+    });
+  });
+
+  app.use('/api/nova', requireFirebaseAuth, requireOtpIfConfigured);
 
   // 1. Fast & Resilient Arabic Chat Endpoint (Supports NDJSON Streaming + JSON)
   app.post('/api/nova/chat', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
@@ -451,17 +1228,49 @@ async function startServer() {
         stream?: boolean;
       };
 
-      if (!Array.isArray(messages) || messages.length === 0) {
-        res.status(400).json({ error: 'يرجى كتابة رسالة صالحة قبل الإرسال.' });
+      if (!Array.isArray(messages) || messages.length === 0 || messages.length > 20) {
+        res.status(400).json({ error: 'عدد الرسائل أو صيغتها غير صالحة.' });
         return;
+      }
+
+      if (customInstruction !== undefined && typeof customInstruction !== 'string') {
+        res.status(400).json({ error: 'تنسيق التعليمات الشخصية غير صالح.' });
+        return;
+      }
+
+      const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+      for (const m of messages) {
+        if (!m || (m.role !== 'user' && m.role !== 'assistant')) {
+          res.status(400).json({ error: 'دور المرسل في الرسالة غير صالح.' });
+          return;
+        }
+        if (typeof m.content !== 'string' || m.content.length > 25000) {
+          res.status(400).json({ error: 'محتوى الرسالة غير صالح أو يتجاوز الحد المسموح.' });
+          return;
+        }
+        if (m.attachment) {
+          if (
+            typeof m.attachment.mimeType !== 'string' ||
+            !ALLOWED_IMAGE_MIMES.has(m.attachment.mimeType) ||
+            typeof m.attachment.data !== 'string' ||
+            m.attachment.data.length > 6_000_000 ||
+            !/^[A-Za-z0-9+/=\s]+$/.test(m.attachment.data.slice(0, 200))
+          ) {
+            res.status(400).json({ error: 'الصورة المرفقة غير صالحة أو تتجاوز الحد المسموح.' });
+            return;
+          }
+        }
       }
 
       const ai = getAiClient();
 
       const baseInstruction = [
-        'أنت Nova AI، مساعد ذكاء اصطناعي شخصي ذكي ومتطور.',
-        'التزم بالرد دائمًا باللغة العربية الفصحى الواضحة والأنيقة على كل رسالة يرسلها المستخدم، وافهم طلبه بدقة ونفّذه مباشرة دون حشو أو مقدمات مكررة.',
-        'في الأسئلة الصعبة أو العلمية أو البرمجية المعقدة، قدّم حلاً دقيقًا ومفصلًا ومنظمًا بخطوات واضحة وأمثلة أو أكواد عملية عند الحاجة.',
+        'أنت Nova AI، مساعد ذكاء اصطناعي شخصي ذكي وسريع ودقيق.',
+        'التزم بالرد دائمًا باللغة العربية الفصحى الواضحة والأنيقة على كل رسالة يرسلها المستخدم، وافهم طلبه بدقة ونفّذه مباشرة.',
+        'تحرَّ الدقة العلمية والمنطقية التامة في جميع الإجابات؛ وإذا احتوت الرسالة على صورة أو لقطة كاميرا فاقرأ كل التفاصيل والنصوص والأرقام والعناصر الظاهرة بدقة عالية قبل الإجابة دون تخمين خاطئ.',
+        thinkingDepth === 'high'
+          ? 'في وضع التحليل العميق والأسئلة الصعبة أو العلمية أو البرمجية المعقدة، قدّم حلاً دقيقًا ومفصلًا ومنظمًا بخطوات واضحة وأمثلة أو أكواد عملية عند الحاجة.'
+          : 'أجب بسرعة وإيجاز مباشر: ادخل في صلب الإجابة فورًا دون مقدمات مكررة أو حشو، وقدّم نقاطًا واضحة أو أكوادًا عملية عند الحاجة.',
         customInstruction?.trim()
           ? `\nتعليمات المستخدم الشخصية المخصصة:\n${customInstruction.trim()}`
           : '',
@@ -469,12 +1278,18 @@ async function startServer() {
         .filter(Boolean)
         .join('\n');
 
-      // Normalize contents and merge consecutive same-role turns cleanly
-      const rawContents = messages
-        .filter((m) => typeof m.content === 'string' && m.content.trim().length > 0)
-        .map((msg) => {
+      // Normalize contents (supporting image-only messages cleanly), trim oversized history for fast prefill, and merge consecutive same-role turns
+      const recentMessages = messages.slice(-8);
+      const rawContents = recentMessages
+        .filter((m) => {
+          const hasText = typeof m.content === 'string' && m.content.trim().length > 0;
+          const hasImg = Boolean(m.attachment?.data && m.attachment?.mimeType);
+          return hasText || hasImg;
+        })
+        .map((msg, idx) => {
           const parts: ChatContentPart[] = [];
-          if (msg.attachment?.data && msg.attachment?.mimeType) {
+          const hasImg = Boolean(msg.attachment?.data && msg.attachment?.mimeType);
+          if (hasImg && msg.attachment) {
             parts.push({
               inlineData: {
                 data: msg.attachment.data,
@@ -482,7 +1297,10 @@ async function startServer() {
               },
             });
           }
-          parts.push({ text: msg.content.trim() });
+          const isLatestTurn = idx === recentMessages.length - 1;
+          const rawText = typeof msg.content === 'string' ? msg.content.trim() : '';
+          const cleanText = rawText || (hasImg ? 'حلّل هذه الصورة بالتفصيل واشرح ما يظهر فيها بدقة.' : '');
+          parts.push({ text: isLatestTurn ? cleanText : cleanText.slice(0, 2500) });
           return {
             role: msg.role === 'assistant' ? 'model' : 'user',
             parts,
@@ -500,13 +1318,15 @@ async function startServer() {
       }
 
       if (contents.length === 0) {
-        res.status(400).json({ error: 'يرجى كتابة رسالة صالحة قبل الإرسال.' });
+        res.status(400).json({ error: 'يرجى كتابة رسالة أو إرفاق صورة قبل الإرسال.' });
         return;
       }
 
+      const hasImageInRequest = contents.some((turn) => turn.parts.some((p) => Boolean(p.inlineData)));
+
       // Non-streaming compatibility path
       if (!stream) {
-        const result = await generateChatReply(ai, contents, baseInstruction, thinkingDepth);
+        const result = await generateChatReply(ai, contents, baseInstruction, thinkingDepth, hasImageInRequest);
         if (!result.text) {
           res.status(502).json({
             error: result.finishReason
@@ -545,9 +1365,9 @@ async function startServer() {
       };
 
       const complex = isComplexPrompt(contents);
-      const attempts = buildChatAttempts(thinkingDepth, complex);
+      const attempts = buildChatAttempts(thinkingDepth, hasImageInRequest);
 
-      writeEvent({ type: 'status', phase: complex || thinkingDepth === 'high' ? 'thinking' : 'generating' });
+      writeEvent({ type: 'status', phase: thinkingDepth === 'high' || complex ? 'thinking' : 'generating' });
 
       heartbeatTimer = setInterval(() => {
         writeEvent({ type: 'ping' });
@@ -570,19 +1390,19 @@ async function startServer() {
 
         const attemptController = new AbortController();
         activeAbortController = attemptController;
-        let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
-        const resetInactivityTimer = () => {
-          if (inactivityTimer) clearTimeout(inactivityTimer);
-          inactivityTimer = setTimeout(() => {
-            attemptController.abort(new Error('TimeoutError: Stream chunk inactivity timeout'));
-          }, attempt.inactivityTimeoutMs);
-        };
-
         let accumulatedText = '';
         let sentThinkingHint = false;
+        let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+        const resetWatchdogTimer = () => {
+          if (inactivityTimer) clearTimeout(inactivityTimer);
+          const timeoutMs = accumulatedText.length > 0 ? attempt.inactivityTimeoutMs : attempt.firstTokenTimeoutMs;
+          inactivityTimer = setTimeout(() => {
+            attemptController.abort(new Error('TimeoutError: Stream inactivity timeout'));
+          }, timeoutMs);
+        };
 
         try {
-          resetInactivityTimer();
+          resetWatchdogTimer();
           const responseStream = await ai.models.generateContentStream({
             model: attempt.model,
             contents,
@@ -595,7 +1415,6 @@ async function startServer() {
 
           for await (const chunk of responseStream) {
             if (clientDisconnected) break;
-            resetInactivityTimer();
 
             const { delta, hasThought, finishReason } = extractStreamChunkInfo(chunk);
             if (finishReason) {
@@ -609,6 +1428,7 @@ async function startServer() {
               accumulatedText += delta;
               writeEvent({ type: 'delta', text: delta });
             }
+            resetWatchdogTimer();
           }
 
           if (clientDisconnected) return;
@@ -693,10 +1513,10 @@ async function startServer() {
         `نص الرسالة:\n${message.trim()}`,
       ].join('\n');
 
-      const attempts: Array<{ model: string; delayMs: number }> = [
-        { model: 'gemini-3.1-flash-lite', delayMs: 0 },
-        { model: 'gemini-3.1-flash-lite', delayMs: 600 },
-        { model: 'gemini-4-hydrogen', delayMs: 400 },
+      const attempts: Array<{ model: string; thinkingLevel: ThinkingLevel; delayMs: number }> = [
+        { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, delayMs: 0 },
+        { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, delayMs: 0 },
+        { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.LOW, delayMs: 150 },
       ];
 
       let lastError: unknown;
@@ -710,6 +1530,7 @@ async function startServer() {
             contents: userPrompt,
             config: {
               systemInstruction,
+              thinkingConfig: { thinkingLevel: attempt.thinkingLevel },
               responseMimeType: 'application/json',
               responseSchema: {
                 type: Type.OBJECT,
@@ -781,6 +1602,336 @@ async function startServer() {
     }
   });
 
+  // 3. Text-to-Speech Endpoint for Listening to Nova AI Replies
+  app.post('/api/nova/tts', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+    try {
+      const { text, voiceName = 'Kore' } = req.body as {
+        text?: string;
+        voiceName?: string;
+      };
+
+      const cleanText = (text || '').replace(/[*#`>_~]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1500);
+      if (!cleanText) {
+        res.status(400).json({ error: 'النص فارغ ولا يمكن قراءته.' });
+        return;
+      }
+
+      const ai = getAiClient();
+      const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
+      const chosenVoice = allowedVoices.includes(voiceName) ? voiceName : 'Kore';
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: cleanText }],
+          },
+        ],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: chosenVoice },
+            },
+          },
+        },
+      });
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64Audio) {
+        res.status(502).json({ error: 'تعذر توليد الصوت حاليًا.' });
+        return;
+      }
+
+      res.json({ audioBase64: base64Audio, mimeType: 'audio/wav' });
+    } catch (err) {
+      console.error('[Nova AI TTS Error]:', err);
+      const mapped = mapGeminiError(err);
+      res.status(mapped.status).json({ error: mapped.message, requiresPaidKey: mapped.requiresPaidKey });
+    }
+  });
+
+  // 4. Turn-Based Voice Conversation Fallback Endpoint (Audio -> Transcript + Reply + Spoken Audio)
+  app.post('/api/nova/voice-turn', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+    try {
+      const { audioBase64, mimeType = 'audio/webm', history = [], customInstruction, voiceName = 'Kore' } = req.body as {
+        audioBase64?: string;
+        mimeType?: string;
+        history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+        customInstruction?: string;
+        voiceName?: string;
+      };
+
+      if (
+        !audioBase64 ||
+        typeof audioBase64 !== 'string' ||
+        audioBase64.length > 6_000_000 ||
+        typeof mimeType !== 'string' ||
+        !['audio/webm', 'audio/mp4', 'audio/ogg', 'audio/wav', 'audio/mpeg', 'audio/webm;codecs=opus'].includes(
+          mimeType.toLowerCase()
+        )
+      ) {
+        res.status(400).json({ error: 'الصيغة الصوتية غير صالحة أو يتجاوز التسجيل الحد المسموح.' });
+        return;
+      }
+
+      const ai = getAiClient();
+      const safeHistory = Array.isArray(history)
+        ? history.slice(-6).map((h) => `${h.role === 'assistant' ? 'Nova AI' : 'المستخدم'}: ${h.content.slice(0, 600)}`).join('\n')
+        : '';
+
+      const systemInstruction = [
+        'أنت Nova AI في محادثة صوتية طبيعية وودية باللغة العربية.',
+        'استمع إلى التسجيل الصوتي للمستخدم، واكتب النص الدقيق لما قاله في حقل userTranscript، ثم أجب عليه بإجابة طبيعية دقيقة ومختصرة وودودة تصلح للحديث الصوتي المباشر في حقل replyText.',
+        customInstruction?.trim() ? `تعليمات المستخدم الشخصية:\n${customInstruction.trim()}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      const promptText = safeHistory
+        ? `سياق الحوار السابق:\n${safeHistory}\n\nاستمع للصوت المرفق وأجب بصيغة JSON.`
+        : 'استمع للصوت المرفق وأجب بصيغة JSON.';
+
+      const turnModels: Array<{ model: string; level: ThinkingLevel }> = [
+        { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MINIMAL },
+        { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW },
+      ];
+
+      let userTranscript = '';
+      let replyText = '';
+      let lastError: unknown;
+
+      for (const item of turnModels) {
+        try {
+          const response = await ai.models.generateContent({
+            model: item.model,
+            contents: {
+              parts: [
+                { inlineData: { mimeType, data: audioBase64 } },
+                { text: promptText },
+              ],
+            },
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: item.level },
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  userTranscript: { type: Type.STRING },
+                  replyText: { type: Type.STRING },
+                },
+                required: ['userTranscript', 'replyText'],
+              },
+            },
+          });
+
+          const raw = extractGeminiText(response);
+          if (!raw) continue;
+          const parsed = JSON.parse(raw) as { userTranscript?: string; replyText?: string };
+          if (parsed.replyText?.trim()) {
+            userTranscript = (parsed.userTranscript || '').trim();
+            replyText = parsed.replyText.trim();
+            break;
+          }
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      if (!replyText) {
+        throw lastError ?? new Error('EMPTY_VOICE_REPLY');
+      }
+
+      let audioReplyBase64: string | null = null;
+      try {
+        const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
+        const chosenVoice = allowedVoices.includes(voiceName) ? voiceName : 'Kore';
+        const ttsRes = await ai.models.generateContent({
+          model: 'gemini-3.8-flash-lite-tts',
+          contents: [{ role: 'user', parts: [{ text: replyText.slice(0, 1000) }] }],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: chosenVoice },
+              },
+            },
+          },
+        });
+        audioReplyBase64 = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
+      } catch (ttsErr) {
+        console.warn('[Nova AI Voice Turn TTS fallback]:', ttsErr);
+      }
+
+      res.json({
+        userTranscript,
+        replyText,
+        audioBase64: audioReplyBase64,
+        mimeType: audioReplyBase64 ? 'audio/wav' : null,
+      });
+    } catch (err) {
+      console.error('[Nova AI Voice Turn Error]:', err);
+      const mapped = mapGeminiError(err);
+      res.status(mapped.status).json({ error: mapped.message, requiresPaidKey: mapped.requiresPaidKey });
+    }
+  });
+
+  // 5. Structured PowerPoint (.pptx) Deck Generation Endpoint
+  app.post('/api/nova/generate-pptx', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+    try {
+      const {
+        topic,
+        details = '',
+        slideCount = 8,
+        audience = 'عام',
+        language = 'ar',
+      } = req.body as {
+        topic?: string;
+        details?: string;
+        slideCount?: number;
+        audience?: string;
+        language?: 'ar' | 'en';
+      };
+
+      const cleanTopic = typeof topic === 'string' ? topic.trim().slice(0, 240) : '';
+      if (!cleanTopic || cleanTopic.length < 2) {
+        res.status(400).json({ error: 'يرجى إدخال عنوان أو موضوع العرض التقديمي.' });
+        return;
+      }
+      const safeDetails = typeof details === 'string' ? details.slice(0, 6000) : '';
+      const safeAudience = typeof audience === 'string' ? audience.slice(0, 160) : 'عام';
+      const safeLanguage = language === 'en' ? 'en' : 'ar';
+
+      const targetSlides = Math.min(18, Math.max(4, Number(slideCount) || 8));
+      const ai = getAiClient();
+
+      const systemInstruction = [
+        'أنت خبير تصميم عروض PowerPoint التقديمية الاحترافية في Nova AI.',
+        'أنشئ محتوى عرض تقديمي متكامل ومفصل ومنظم بدقة بالغة يلتزم بكل تفصيل طلبه المستخدم.',
+        safeLanguage === 'en'
+          ? 'Write all slide titles, bullets, metrics, and speaker notes in crisp, executive English.'
+          : 'اكتب جميع عناوين الشرائح ونقاط المحتوى والإحصائيات وملاحظات المتحدث باللغة العربية الفصحى الدقيقة والواضحة.',
+        `العدد المطلوب للشرائح هو بالضبط ${targetSlides} شريحة:`,
+        '- الشريحة الأولى يجب أن تكون بنوع layout="title" (شريحة الغلاف).',
+        '- الشريحة الأخيرة يجب أن تكون بنوع layout="conclusion" (الخلاصة والتوصيات).',
+        '- نوّع الشرائح الوسطى بين "bullets" و"two-column" (للمقارنات أو المحاور المزدوجة) و"metrics" (للأرقام والمؤشرات أو المعالم الأساسية عند مناسبتها).',
+        '- تجنب الحشو؛ اجعل كل نقطة غنية بالمعلومة ومحددة وعملية ومطابقة تمامًا للتفاصيل التي ذكرها المستخدم.',
+      ].join('\n');
+
+      const userPrompt = [
+        `موضوع العرض الرئيسي: ${cleanTopic}`,
+        safeDetails.trim() ? `التفاصيل والمحاور الدقيقة التي يريدها المستخدم:\n${safeDetails.trim()}` : '',
+        `الجمهور المستهدف: ${safeAudience.trim() || 'عام'}`,
+        `عدد الشرائح المطلوب: ${targetSlides}`,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+
+      const attempts: Array<{ model: string; level: ThinkingLevel }> = [
+        { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW },
+        { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MEDIUM },
+        { model: 'gemini-4-hydrogen', level: ThinkingLevel.MEDIUM },
+      ];
+
+      let lastError: unknown;
+      for (const attempt of attempts) {
+        try {
+          const response = await ai.models.generateContent({
+            model: attempt.model,
+            contents: userPrompt,
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: attempt.level },
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  deckTitle: { type: Type.STRING },
+                  deckSubtitle: { type: Type.STRING },
+                  slides: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        layout: {
+                          type: Type.STRING,
+                          enum: ['title', 'bullets', 'two-column', 'metrics', 'conclusion'],
+                        },
+                        title: { type: Type.STRING },
+                        subtitle: { type: Type.STRING },
+                        bullets: {
+                          type: Type.ARRAY,
+                          items: { type: Type.STRING },
+                        },
+                        rightColumnTitle: { type: Type.STRING },
+                        rightColumnBullets: {
+                          type: Type.ARRAY,
+                          items: { type: Type.STRING },
+                        },
+                        metrics: {
+                          type: Type.ARRAY,
+                          items: {
+                            type: Type.OBJECT,
+                            properties: {
+                              label: { type: Type.STRING },
+                              value: { type: Type.STRING },
+                            },
+                            required: ['label', 'value'],
+                          },
+                        },
+                        speakerNotes: { type: Type.STRING },
+                      },
+                      required: ['layout', 'title', 'bullets', 'speakerNotes'],
+                    },
+                  },
+                },
+                required: ['deckTitle', 'deckSubtitle', 'slides'],
+              },
+            },
+          });
+
+          const rawText = extractGeminiText(response);
+          if (!rawText) {
+            lastError = new Error('EMPTY_PPTX_RESPONSE');
+            continue;
+          }
+
+          const parsed = JSON.parse(rawText) as {
+            deckTitle?: string;
+            deckSubtitle?: string;
+            slides?: Array<Record<string, unknown>>;
+          };
+
+          if (!Array.isArray(parsed.slides) || parsed.slides.length === 0) {
+            lastError = new Error('EMPTY_PPTX_SLIDES');
+            continue;
+          }
+
+          res.json({
+            deckTitle: (parsed.deckTitle || cleanTopic).trim(),
+            deckSubtitle: (parsed.deckSubtitle || '').trim(),
+            slides: parsed.slides,
+            model: attempt.model,
+          });
+          return;
+        } catch (err) {
+          lastError = err;
+          if (!isRetryableError(err) && !(err instanceof SyntaxError)) {
+            throw err;
+          }
+        }
+      }
+
+      throw lastError ?? new Error('EMPTY_PPTX_RESPONSE');
+    } catch (err) {
+      console.error('[Nova AI PPTX Error]:', err);
+      const mapped = mapGeminiError(err);
+      res.status(mapped.status).json({ error: mapped.message, requiresPaidKey: mapped.requiresPaidKey });
+    }
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -790,14 +1941,304 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          const base = path.basename(filePath);
+          if (
+            base === 'index.html' ||
+            base === 'sw.js' ||
+            base === 'registerSW.js' ||
+            base === 'manifest.webmanifest'
+          ) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+          } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
+  // Global JSON parse / payload / unexpected error sanitizer (never leak stack traces)
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const errObj = err as { type?: string; status?: number };
+    if (errObj?.type === 'entity.too.large' || errObj?.status === 413) {
+      res.status(413).json({ error: 'حجم البيانات المرسلة أكبر من الحد المسموح.' });
+      return;
+    }
+    if (err instanceof SyntaxError || errObj?.type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'تنسيق البيانات المرسلة غير صالح.' });
+      return;
+    }
+    console.error('[Nova AI Unexpected Server Error]:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'حدث خطأ غير متوقع في الخادم.' });
+    }
+  });
+
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+
+  httpServer.on('upgrade', (request: IncomingMessage, socket, head) => {
+    try {
+      const reqUrl = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+      if (reqUrl.pathname !== '/api/nova/live') {
+        return;
+      }
+      const clientIp = getClientIp(request);
+      if (!isTrustedRequestOrigin(request.headers) || isIpTemporarilyBanned(clientIp) > 0) {
+        socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const ipSocketCount = wsActiveByIp.get(clientIp) ?? 0;
+      if (ipSocketCount >= 10) {
+        socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  wss.on('connection', async (clientWs: WebSocket, request: IncomingMessage) => {
+    const clientIp = getClientIp(request);
+    wsActiveByIp.set(clientIp, (wsActiveByIp.get(clientIp) ?? 0) + 1);
+
+    let liveSession: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
+    let activeUid: string | null = null;
+    let isClosed = false;
+    let authDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let frameWindowStart = Date.now();
+    let frameWindowCount = 0;
+
+    const closeAll = () => {
+      if (isClosed) return;
+      isClosed = true;
+      if (authDeadlineTimer) {
+        clearTimeout(authDeadlineTimer);
+        authDeadlineTimer = null;
+      }
+      const curIpCount = wsActiveByIp.get(clientIp) ?? 0;
+      if (curIpCount <= 1) wsActiveByIp.delete(clientIp);
+      else wsActiveByIp.set(clientIp, curIpCount - 1);
+
+      if (activeUid) {
+        const curUidCount = wsActiveByUid.get(activeUid) ?? 0;
+        if (curUidCount <= 1) wsActiveByUid.delete(activeUid);
+        else wsActiveByUid.set(activeUid, curUidCount - 1);
+        activeUid = null;
+      }
+      try {
+        liveSession?.close();
+      } catch {
+        // ignore close errors
+      }
+      try {
+        if (clientWs.readyState === clientWs.OPEN || clientWs.readyState === clientWs.CONNECTING) {
+          clientWs.close();
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    const initializeLiveBridge = async (
+      idToken: string,
+      otpToken: string,
+      voiceParam: string,
+      customInstruction: string
+    ) => {
+      try {
+        const verified = await verifyFirebaseIdToken(idToken);
+        if (!verified) {
+          recordAuthFailure(clientIp, '/api/nova/live');
+          if (clientWs.readyState === clientWs.OPEN) {
+            clientWs.send(JSON.stringify({ error: 'انتهت صلاحية جلسة التحقق. يرجى إعادة المحاولة.' }));
+          }
+          closeAll();
+          return;
+        }
+        const { uid } = verified;
+
+        if (isOtpDeliveryConfigured()) {
+          const uaHash = computeUaHash(request.headers);
+          if (!verifyOtpSessionToken(otpToken, uid, uaHash)) {
+            if (clientWs.readyState === clientWs.OPEN) {
+              clientWs.send(JSON.stringify({ error: 'يجب إتمام التحقق برمز Gmail قبل فتح المحادثة الصوتية.' }));
+            }
+            closeAll();
+            return;
+          }
+        }
+
+        const uidSockets = wsActiveByUid.get(uid) ?? 0;
+        if (uidSockets >= 3) {
+          if (clientWs.readyState === clientWs.OPEN) {
+            clientWs.send(JSON.stringify({ error: 'لديك الحد الأقصى من جلسات الصوت المباشر النشطة حاليًا.' }));
+          }
+          closeAll();
+          return;
+        }
+        activeUid = uid;
+        wsActiveByUid.set(uid, uidSockets + 1);
+
+        const ai = getAiClient();
+        const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
+        const chosenVoice = allowedVoices.includes(voiceParam) ? voiceParam : 'Kore';
+
+        const systemInstruction = [
+          'أنت Nova AI في محادثة صوتية مباشرة بالوقت الفعلي.',
+          'تحدث باللغة العربية الواضحة والطبيعية والودودة بأسلوب محاورة تفاعلية سريعة ودقيقة.',
+          'اجعل ردودك الصوتية مركزة ومفيدة وواضحة ومباشرة دون إطالة مملة، وإذا سألك المستخدم سؤالاً صعباً فأعطه الإجابة الصحيحة بدقة.',
+          customInstruction ? `تعليمات المستخدم الشخصية:\n${customInstruction.slice(0, 600)}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        liveSession = await ai.live.connect({
+          model: 'gemini-3.8-live',
+          config: {
+            responseModalities: [Modality.AUDIO],
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: chosenVoice },
+              },
+            },
+            systemInstruction,
+          },
+          callbacks: {
+            onopen: () => {
+              if (!isClosed && clientWs.readyState === clientWs.OPEN) {
+                clientWs.send(JSON.stringify({ ready: true }));
+              }
+            },
+            onmessage: (message: LiveServerMessage) => {
+              if (isClosed || clientWs.readyState !== clientWs.OPEN) return;
+              const content = message.serverContent;
+              if (content?.inputTranscription?.text) {
+                clientWs.send(JSON.stringify({ inputTranscript: content.inputTranscription.text }));
+              }
+              if (content?.outputTranscription?.text) {
+                clientWs.send(JSON.stringify({ outputTranscript: content.outputTranscription.text }));
+              }
+              for (const part of content?.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
+                  clientWs.send(JSON.stringify({ audio: part.inlineData.data }));
+                }
+              }
+              if (content?.interrupted) {
+                clientWs.send(JSON.stringify({ interrupted: true }));
+              }
+              if (content?.turnComplete) {
+                clientWs.send(JSON.stringify({ turnComplete: true }));
+              }
+            },
+            onerror: (err) => {
+              console.error('[Nova AI Live WS error]:', err);
+              if (!isClosed && clientWs.readyState === clientWs.OPEN) {
+                clientWs.send(JSON.stringify({ error: 'حدث انقطاع في جلسة الصوت المباشر.' }));
+              }
+              closeAll();
+            },
+            onclose: () => {
+              closeAll();
+            },
+          },
+        });
+      } catch (err) {
+        console.error('[Nova AI Live Setup Error]:', err);
+        const mapped = mapGeminiError(err);
+        if (clientWs.readyState === clientWs.OPEN) {
+          clientWs.send(JSON.stringify({ error: mapped.message }));
+        }
+        closeAll();
+      }
+    };
+
+    authDeadlineTimer = setTimeout(() => {
+      if (!activeUid && !isClosed) {
+        closeAll();
+      }
+    }, 6000);
+
+    clientWs.on('message', (rawData) => {
+      if (isClosed) return;
+      const now = Date.now();
+      if (now - frameWindowStart > 1000) {
+        frameWindowStart = now;
+        frameWindowCount = 0;
+      }
+      frameWindowCount += 1;
+      if (frameWindowCount > 60) {
+        closeAll();
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(rawData.toString()) as {
+          type?: string;
+          token?: string;
+          otpToken?: string;
+          voice?: string;
+          instruction?: string;
+          audio?: string;
+          video?: string;
+          text?: string;
+        };
+
+        if (!activeUid) {
+          if (parsed.type === 'auth' && typeof parsed.token === 'string') {
+            if (authDeadlineTimer) {
+              clearTimeout(authDeadlineTimer);
+              authDeadlineTimer = null;
+            }
+            initializeLiveBridge(
+              parsed.token.trim(),
+              typeof parsed.otpToken === 'string' ? parsed.otpToken.trim() : '',
+              typeof parsed.voice === 'string' ? parsed.voice.trim() : 'Kore',
+              typeof parsed.instruction === 'string' ? parsed.instruction.trim() : ''
+            );
+          } else {
+            closeAll();
+          }
+          return;
+        }
+
+        if (!liveSession) return;
+        if (parsed.audio && typeof parsed.audio === 'string' && parsed.audio.length <= 128 * 1024) {
+          liveSession.sendRealtimeInput({
+            audio: { data: parsed.audio, mimeType: 'audio/pcm;rate=16000' },
+          });
+        } else if (parsed.video && typeof parsed.video === 'string' && parsed.video.length <= 200 * 1024) {
+          liveSession.sendRealtimeInput({
+            video: { data: parsed.video, mimeType: 'image/jpeg' },
+          });
+        } else if (parsed.text && typeof parsed.text === 'string' && parsed.text.length <= 4000) {
+          liveSession.sendRealtimeInput({ text: parsed.text });
+        }
+      } catch {
+        // ignore malformed client frame
+      }
+    });
+
+    clientWs.on('close', closeAll);
+    clientWs.on('error', closeAll);
+  });
+
   const port = Number(process.env.PORT) || 3000;
-  app.listen(port, '0.0.0.0', () => {
+  httpServer.listen(port, '0.0.0.0', () => {
     console.log(`Nova AI server listening on http://0.0.0.0:${port}`);
   });
 }

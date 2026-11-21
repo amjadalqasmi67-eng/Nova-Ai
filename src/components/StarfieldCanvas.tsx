@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { ThemeMode } from '../lib/theme';
+import { BACKGROUND_PRESETS, BackgroundStyle, ThemeMode } from '../lib/theme';
 
 interface Star {
   x: number;
@@ -15,17 +15,20 @@ interface Star {
 
 interface StarfieldCanvasProps {
   themeMode: ThemeMode;
+  backgroundStyle?: BackgroundStyle;
 }
 
-export function StarfieldCanvas({ themeMode }: StarfieldCanvasProps) {
+export function StarfieldCanvas({ themeMode, backgroundStyle = 'cosmos' }: StarfieldCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const themeRef = useRef<ThemeMode>(themeMode);
+  const preset = BACKGROUND_PRESETS[backgroundStyle] || BACKGROUND_PRESETS.cosmos;
 
   useEffect(() => {
     themeRef.current = themeMode;
   }, [themeMode]);
 
   useEffect(() => {
+    if (!preset.showStars) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -40,13 +43,18 @@ export function StarfieldCanvas({ themeMode }: StarfieldCanvasProps) {
     const createStars = () => {
       const count = Math.min(220, Math.floor((width * height) / 7800));
       stars = Array.from({ length: count }, (_, idx) => {
-        const layer = idx % 3; // 0: distant, 1: mid, 2: foreground
+        const layer = idx % 3;
         const tintRoll = idx % 8;
         const tint: Star['tint'] = tintRoll === 0 ? 'violet' : tintRoll <= 2 ? 'blue' : 'white';
         return {
           x: Math.random() * width,
           y: Math.random() * height,
-          radius: layer === 0 ? Math.random() * 0.8 + 0.35 : layer === 1 ? Math.random() * 1.15 + 0.55 : Math.random() * 1.55 + 0.8,
+          radius:
+            layer === 0
+              ? Math.random() * 0.8 + 0.35
+              : layer === 1
+                ? Math.random() * 1.15 + 0.55
+                : Math.random() * 1.55 + 0.8,
           vx: (Math.random() - 0.5) * 0.08,
           vy: -(layer === 0 ? 0.06 : layer === 1 ? 0.14 : 0.24),
           opacity: layer === 0 ? 0.38 : layer === 1 ? 0.62 : 0.88,
@@ -100,7 +108,6 @@ export function StarfieldCanvas({ themeMode }: StarfieldCanvasProps) {
             ctx.fillStyle = `rgba(241, 245, 249, ${alpha})`;
           }
         } else {
-          // Soft cosmic stars in Light Mode
           if (star.tint === 'blue') {
             ctx.fillStyle = `rgba(37, 99, 235, ${alpha * 0.42})`;
           } else if (star.tint === 'violet') {
@@ -126,11 +133,11 @@ export function StarfieldCanvas({ themeMode }: StarfieldCanvasProps) {
       window.removeEventListener('resize', handleResize);
       if (animationId) cancelAnimationFrame(animationId);
     };
-  }, []);
+  }, [preset.showStars]);
 
   return (
     <div className="fixed inset-0 pointer-events-none overflow-hidden z-0" aria-hidden="true">
-      {themeMode === 'dark' && (
+      {themeMode === 'dark' && backgroundStyle === 'cosmos' && (
         <img
           src="/src/assets/images/nova_cosmos_backdrop_1795088891481.jpg"
           alt=""
@@ -139,15 +146,12 @@ export function StarfieldCanvas({ themeMode }: StarfieldCanvasProps) {
         />
       )}
       <div
-        className="absolute inset-0 transition-opacity duration-300"
+        className="absolute inset-0 transition-all duration-300"
         style={{
-          background:
-            themeMode === 'dark'
-              ? 'radial-gradient(ellipse 65% 45% at 80% 12%, rgba(37, 99, 235, 0.16), transparent 70%), radial-gradient(ellipse 55% 45% at 15% 88%, rgba(124, 58, 237, 0.16), transparent 70%)'
-              : 'radial-gradient(ellipse 65% 45% at 80% 12%, rgba(59, 130, 246, 0.10), transparent 70%), radial-gradient(ellipse 55% 45% at 15% 88%, rgba(139, 92, 246, 0.10), transparent 70%)',
+          background: themeMode === 'dark' ? preset.auraDark : preset.auraLight,
         }}
       />
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+      {preset.showStars && <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />}
     </div>
   );
 }

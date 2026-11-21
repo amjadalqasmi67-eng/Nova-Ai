@@ -13,6 +13,7 @@ interface HelpPageProps {
   onUsePrompt: (prompt: string) => void;
   onGoToSettings: () => void;
   onGoToContact: () => void;
+  onGoToFaq?: () => void;
 }
 
 const GUIDE_STEPS = [
@@ -33,16 +34,16 @@ const GUIDE_STEPS = [
   {
     step: '03',
     icon: Paperclip,
-    title: 'أرفق الصور لتحليلها فورًا',
+    title: 'صوّر بالكاميرا أو تحدّث صوتيًا مباشرة',
     description:
-      'اضغط على أيقونة المشبك بجانب حقل الكتابة لرفع صورة أو لقطة شاشة، ثم اكتب سؤالك عنها ليقرأ Nova AI محتواها ويشرحه لك.',
+      'استخدم زر الكاميرا لالتقاط أي صورة وتحليلها فورًا دون الحاجة لكتابة نص، أو افتح المحادثة الصوتية المباشرة للتحدث مع Nova AI صوتيًا.',
   },
   {
     step: '04',
     icon: Settings,
-    title: 'خصص شخصية المساعد وألوان الواجهة',
+    title: 'خصص صورة حسابك والخلفية وألوان الخطوط',
     description:
-      'من صفحة «الإعدادات» يمكنك كتابة تعليماتك الشخصية الدائمة للمساعد، وتغيير ألوان الواجهة، والتبديل بين الوضع الداكن والفاتح، وإضافة رمز قفل سريع.',
+      'من صفحة «الإعدادات» يمكنك وضع صورة شخصية لحسابك، وتغيير الخلفية وألوان الخطوط والأزرار (البنفسجي، الأخضر، الأحمر، الأصفر، الأزرق)، وإنشاء عروض PowerPoint من قسم العروض.',
   },
 ];
 
@@ -65,7 +66,7 @@ const EXAMPLE_PROMPTS = [
   },
 ];
 
-export function HelpPage({ onUsePrompt, onGoToSettings, onGoToContact }: HelpPageProps) {
+export function HelpPage({ onUsePrompt, onGoToSettings, onGoToContact, onGoToFaq }: HelpPageProps) {
   return (
     <div className="flex-1 min-h-0 overflow-y-auto max-w-5xl w-full mx-auto px-3.5 sm:px-6 py-5 sm:py-6 space-y-6 sm:space-y-8">
       {/* Header */}
@@ -171,14 +172,25 @@ export function HelpPage({ onUsePrompt, onGoToSettings, onGoToContact }: HelpPag
             إذا واجهت مشكلة فنية أو لديك استفسار، أرسل لنا رسالة مباشرة عبر نموذج التواصل.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={onGoToContact}
-          className="accent-btn inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-white text-xs sm:text-sm font-semibold cursor-pointer shrink-0 self-start sm:self-auto min-h-[44px]"
-        >
-          <Mail className="w-4 h-4" />
-          <span>الانتقال إلى تواصل معنا</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0 self-start sm:self-auto">
+          {onGoToFaq && (
+            <button
+              type="button"
+              onClick={onGoToFaq}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-800 dark:text-slate-100 text-xs sm:text-sm font-semibold cursor-pointer min-h-[44px]"
+            >
+              <span>الأسئلة الشائعة</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onGoToContact}
+            className="accent-btn inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-white text-xs sm:text-sm font-semibold cursor-pointer min-h-[44px]"
+          >
+            <Mail className="w-4 h-4" />
+            <span>الانتقال إلى تواصل معنا</span>
+          </button>
+        </div>
       </section>
     </div>
   );

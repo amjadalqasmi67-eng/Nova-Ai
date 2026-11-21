@@ -28,11 +28,23 @@
         },
         "accentColor": {
           "type": "string",
-          "enum": ["violet", "blue", "emerald", "rose"]
+          "enum": ["violet", "blue", "emerald", "rose", "amber"]
         },
         "themeMode": {
           "type": "string",
           "enum": ["dark", "light"]
+        },
+        "backgroundStyle": {
+          "type": "string",
+          "enum": ["cosmos", "midnight-violet", "forest-emerald", "crimson-night", "golden-amber", "clean"]
+        },
+        "fontColor": {
+          "type": "string",
+          "enum": ["auto", "violet", "emerald", "rose", "amber", "blue"]
+        },
+        "avatarDataUrl": {
+          "type": "string",
+          "maxLength": 65000
         },
         "createdAt": {
           "type": "string",

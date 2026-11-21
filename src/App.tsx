@@ -19,6 +19,7 @@ import {
   X,
   ShieldAlert,
   MessageSquare,
+  Presentation,
   Info,
   BookOpen,
   HelpCircle,
@@ -29,7 +30,9 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { StarfieldCanvas } from './components/StarfieldCanvas';
 import { NovaStarLogo } from './components/NovaStarLogo';
 import { LoginGate } from './components/LoginGate';
+import { OtpGate } from './components/OtpGate';
 import { ChatWorkspace } from './components/ChatWorkspace';
+import { PresentationStudio } from './components/PresentationStudio';
 import { AboutPage } from './components/AboutPage';
 import { HelpPage } from './components/HelpPage';
 import { FaqPage } from './components/FaqPage';
@@ -40,64 +43,78 @@ import { PWAInstallButton } from './components/PWAInstallButton';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import {
   AccentColor,
+  BackgroundStyle,
+  FontColor,
   ThemeMode,
   applyThemePreferences,
   getSavedAccent,
+  getSavedBackgroundStyle,
+  getSavedFontColor,
   getSavedTheme,
+  isValidAccentColor,
+  isValidBackgroundStyle,
+  isValidFontColor,
 } from './lib/theme';
 
-type PrimaryTab = 'chat' | 'about' | 'help' | 'faq' | 'contact' | 'owner';
+import {
+  clearFailedPinAttempts,
+  getPinLockoutRemainingMs,
+  getStoredPinHash,
+  hashPin,
+  recordFailedPinAttempt,
+  saveStoredPinHash,
+  verifyStoredPin,
+} from './lib/pinSecurity';
+import { getOtpHeaders, setOtpSessionToken } from './lib/otpSession';
+
+type PrimaryTab = 'chat' | 'pptx' | 'about' | 'help' | 'faq' | 'contact' | 'owner';
 type StudioTab = PrimaryTab | 'settings';
 
 const PUBLIC_NAV_TABS: Array<{ id: PrimaryTab; label: string; icon: typeof MessageSquare }> = [
   { id: 'chat', label: 'المحادثة الذكية', icon: MessageSquare },
+  { id: 'pptx', label: 'عروض PowerPoint', icon: Presentation },
   { id: 'about', label: 'من نحن', icon: Info },
   { id: 'help', label: 'مساعدة', icon: BookOpen },
-  { id: 'faq', label: 'أسئلة شائعة', icon: HelpCircle },
   { id: 'contact', label: 'تواصل معنا', icon: Mail },
 ];
-
-const PIN_STORAGE_KEY = 'nova_ai_session_pin';
 
 function NovaApplication() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [otpStatus, setOtpStatus] = useState<'idle' | 'required' | 'verified'>('idle');
+  const [otpEmailMasked, setOtpEmailMasked] = useState('');
+  const [otpCooldownSec, setOtpCooldownSec] = useState(0);
 
   const [activeTab, setActiveTab] = useState<StudioTab>('chat');
   const [previousTab, setPreviousTab] = useState<PrimaryTab>('chat');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [draftPrompt, setDraftPrompt] = useState<string | null>(null);
+  const [pptxTopicDraft, setPptxTopicDraft] = useState<string | null>(null);
   const [customInstruction, setCustomInstruction] = useState('');
+  const [customAvatarUrl, setCustomAvatarUrl] = useState<string>('');
   const [urgentUnreadCount, setUrgentUnreadCount] = useState(0);
 
   const isOwner = isOwnerAdmin(user);
 
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => getSavedTheme());
   const [accentColor, setAccentColor] = useState<AccentColor>(() => getSavedAccent());
+  const [backgroundStyle, setBackgroundStyle] = useState<BackgroundStyle>(() => getSavedBackgroundStyle());
+  const [fontColor, setFontColor] = useState<FontColor>(() => getSavedFontColor());
 
-  const [savedPin, setSavedPin] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(PIN_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  });
-  const [isScreenLocked, setIsScreenLocked] = useState<boolean>(() => {
-    try {
-      return Boolean(localStorage.getItem(PIN_STORAGE_KEY));
-    } catch {
-      return false;
-    }
-  });
+  const [savedPinHash, setSavedPinHash] = useState<string | null>(() => getStoredPinHash());
+  const [isScreenLocked, setIsScreenLocked] = useState<boolean>(() => Boolean(getStoredPinHash()));
   const [pinAttempt, setPinAttempt] = useState('');
-  const [pinError, setPinError] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [pinLockoutSeconds, setPinLockoutSeconds] = useState<number>(() =>
+    Math.ceil(getPinLockoutRemainingMs() / 1000)
+  );
 
-  // Apply theme & accent color immediately on mount and whenever changed
+  // Apply theme, accent, background style & font color immediately on mount and whenever changed
   useEffect(() => {
-    applyThemePreferences(themeMode, accentColor);
-  }, [themeMode, accentColor]);
+    applyThemePreferences(themeMode, accentColor, backgroundStyle, fontColor);
+  }, [themeMode, accentColor, backgroundStyle, fontColor]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -113,23 +130,29 @@ function NovaApplication() {
               customInstruction: '',
               accentColor,
               themeMode,
+              backgroundStyle,
+              fontColor,
+              avatarDataUrl: '',
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
             });
             setCustomInstruction('');
+            setCustomAvatarUrl('');
           } else {
             const data = snap.data();
             setCustomInstruction(String(data.customInstruction || ''));
-            if (
-              data.accentColor === 'violet' ||
-              data.accentColor === 'blue' ||
-              data.accentColor === 'emerald' ||
-              data.accentColor === 'rose'
-            ) {
+            setCustomAvatarUrl(String(data.avatarDataUrl || ''));
+            if (isValidAccentColor(data.accentColor)) {
               setAccentColor(data.accentColor);
             }
             if (data.themeMode === 'dark' || data.themeMode === 'light') {
               setThemeMode(data.themeMode);
+            }
+            if (isValidBackgroundStyle(data.backgroundStyle)) {
+              setBackgroundStyle(data.backgroundStyle);
+            }
+            if (isValidFontColor(data.fontColor)) {
+              setFontColor(data.fontColor);
             }
           }
         } catch (err) {
@@ -160,6 +183,37 @@ function NovaApplication() {
             // Non-blocking analytics log
           }
         }
+
+        try {
+          const idToken = await firebaseUser.getIdToken();
+          const otpRes = await fetch('/api/auth/otp/status', {
+            headers: {
+              Authorization: `Bearer ${idToken}`,
+              ...getOtpHeaders(),
+            },
+          });
+          if (otpRes.ok) {
+            const otpData = (await otpRes.json()) as {
+              otpRequired?: boolean;
+              emailMasked?: string;
+              cooldownRemainingSec?: number;
+            };
+            setOtpEmailMasked(otpData.emailMasked || firebaseUser.email || '');
+            setOtpCooldownSec(
+              typeof otpData.cooldownRemainingSec === 'number' ? otpData.cooldownRemainingSec : 0
+            );
+            setOtpStatus(otpData.otpRequired ? 'required' : 'verified');
+          } else {
+            setOtpStatus('verified');
+          }
+        } catch {
+          setOtpStatus('verified');
+        }
+      } else {
+        setOtpSessionToken(null);
+        setOtpStatus('idle');
+        setOtpEmailMasked('');
+        setOtpCooldownSec(0);
       }
       setUser(firebaseUser);
       setAuthReady(true);
@@ -219,11 +273,17 @@ function NovaApplication() {
   };
 
   const handleSwitchAccount = async () => {
+    setOtpSessionToken(null);
+    setOtpStatus('idle');
     googleProvider.setCustomParameters({ prompt: 'select_account' });
     await signInWithPopup(auth, googleProvider);
   };
 
   const handleSignOut = async () => {
+    setOtpSessionToken(null);
+    setOtpStatus('idle');
+    setOtpEmailMasked('');
+    setOtpCooldownSec(0);
     await signOut(auth);
     setActiveTab('chat');
   };
@@ -232,6 +292,9 @@ function NovaApplication() {
     customInstruction?: string;
     accentColor?: AccentColor;
     themeMode?: ThemeMode;
+    backgroundStyle?: BackgroundStyle;
+    fontColor?: FontColor;
+    avatarDataUrl?: string;
   }) => {
     if (!user) return;
     const userPath = `users/${user.uid}`;
@@ -249,14 +312,31 @@ function NovaApplication() {
 
   const handleChangeTheme = (mode: ThemeMode) => {
     setThemeMode(mode);
-    applyThemePreferences(mode, accentColor);
+    applyThemePreferences(mode, accentColor, backgroundStyle, fontColor);
     persistUserField({ themeMode: mode }).catch(() => undefined);
   };
 
   const handleChangeAccent = (color: AccentColor) => {
     setAccentColor(color);
-    applyThemePreferences(themeMode, color);
+    applyThemePreferences(themeMode, color, backgroundStyle, fontColor);
     persistUserField({ accentColor: color }).catch(() => undefined);
+  };
+
+  const handleChangeBackground = (bg: BackgroundStyle) => {
+    setBackgroundStyle(bg);
+    applyThemePreferences(themeMode, accentColor, bg, fontColor);
+    persistUserField({ backgroundStyle: bg }).catch(() => undefined);
+  };
+
+  const handleChangeFontColor = (fc: FontColor) => {
+    setFontColor(fc);
+    applyThemePreferences(themeMode, accentColor, backgroundStyle, fc);
+    persistUserField({ fontColor: fc }).catch(() => undefined);
+  };
+
+  const handleUpdateAvatar = async (avatarDataUrl: string) => {
+    await persistUserField({ avatarDataUrl });
+    setCustomAvatarUrl(avatarDataUrl);
   };
 
   const handleSaveInstruction = async (instruction: string) => {
@@ -264,29 +344,68 @@ function NovaApplication() {
     setCustomInstruction(instruction);
   };
 
+  useEffect(() => {
+    if (pinLockoutSeconds <= 0) return;
+    const timer = setInterval(() => {
+      const rem = Math.ceil(getPinLockoutRemainingMs() / 1000);
+      setPinLockoutSeconds(rem);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [pinLockoutSeconds]);
+
   const handleUpdatePin = (pin: string | null) => {
-    try {
-      if (pin) {
-        localStorage.setItem(PIN_STORAGE_KEY, pin);
-        setSavedPin(pin);
-      } else {
-        localStorage.removeItem(PIN_STORAGE_KEY);
-        setSavedPin(null);
-        setIsScreenLocked(false);
-      }
-    } catch {
-      // Storage unavailable
+    if (!pin) {
+      saveStoredPinHash(null);
+      setSavedPinHash(null);
+      setIsScreenLocked(false);
+      setPinError(null);
+      setPinLockoutSeconds(0);
+      return;
     }
+    hashPin(pin)
+      .then((digest) => {
+        saveStoredPinHash(digest);
+        clearFailedPinAttempts();
+        setSavedPinHash(digest);
+        setPinLockoutSeconds(0);
+      })
+      .catch(() => undefined);
   };
 
-  const handleUnlockPin = (e: FormEvent) => {
+  const handleUnlockPin = async (e: FormEvent) => {
     e.preventDefault();
-    if (pinAttempt === savedPin) {
+    const remainingMs = getPinLockoutRemainingMs();
+    if (remainingMs > 0) {
+      const secs = Math.ceil(remainingMs / 1000);
+      setPinLockoutSeconds(secs);
+      setPinError(`تم تقييد المحاولات مؤقتًا للحماية. انتظر ${secs} ثانية.`);
+      return;
+    }
+    if (!savedPinHash) {
+      setIsScreenLocked(false);
+      return;
+    }
+
+    const result = await verifyStoredPin(pinAttempt, savedPinHash);
+    if (result.valid) {
+      clearFailedPinAttempts();
+      if (result.upgradedHash) {
+        saveStoredPinHash(result.upgradedHash);
+        setSavedPinHash(result.upgradedHash);
+      }
       setIsScreenLocked(false);
       setPinAttempt('');
-      setPinError(false);
+      setPinError(null);
+      setPinLockoutSeconds(0);
     } else {
-      setPinError(true);
+      const lockMs = recordFailedPinAttempt();
+      if (lockMs > 0) {
+        const secs = Math.ceil(lockMs / 1000);
+        setPinLockoutSeconds(secs);
+        setPinError(`محاولات خاطئة متكررة. تم قفل الإدخال مؤقتًا لمدة ${secs} ثانية.`);
+      } else {
+        setPinError('رمز القفل غير صحيح');
+      }
     }
   };
 
@@ -316,9 +435,14 @@ function NovaApplication() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [mobileNavOpen]);
 
+  const resolvedAvatarUrl = customAvatarUrl || user?.photoURL || null;
+
   return (
-    <div className="min-h-[100dvh] bg-slate-50 dark:bg-[#050711] text-slate-900 dark:text-slate-100 relative flex flex-col transition-colors duration-200 overflow-x-hidden">
-      <StarfieldCanvas themeMode={themeMode} />
+    <div
+      className="min-h-[100dvh] relative flex flex-col transition-colors duration-200 overflow-x-hidden"
+      style={{ backgroundColor: 'var(--app-bg-color)', color: 'var(--app-text-color)' }}
+    >
+      <StarfieldCanvas themeMode={themeMode} backgroundStyle={backgroundStyle} />
 
       {!authReady ? (
         <div className="relative z-10 min-h-[100dvh] flex flex-col items-center justify-center gap-4 px-4">
@@ -327,7 +451,15 @@ function NovaApplication() {
         </div>
       ) : !user ? (
         <LoginGate onSignIn={handleSignIn} isLoading={authLoading} error={authError} />
-      ) : isScreenLocked && savedPin ? (
+      ) : otpStatus === 'required' ? (
+        <OtpGate
+          user={user}
+          initialEmailMasked={otpEmailMasked}
+          initialCooldownSec={otpCooldownSec}
+          onVerified={() => setOtpStatus('verified')}
+          onSignOut={handleSignOut}
+        />
+      ) : isScreenLocked && savedPinHash ? (
         <div className="relative z-20 min-h-[100dvh] flex items-center justify-center p-4 sm:p-6">
           <form
             onSubmit={handleUnlockPin}
@@ -344,20 +476,28 @@ function NovaApplication() {
               type="password"
               inputMode="numeric"
               autoFocus
+              disabled={pinLockoutSeconds > 0}
               value={pinAttempt}
               onChange={(e) => {
                 setPinAttempt(e.target.value);
-                setPinError(false);
+                setPinError(null);
               }}
               placeholder="••••"
-              className="accent-focus w-full text-center tracking-[0.4em] rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/15 focus:outline-none px-4 py-3 text-lg text-slate-900 dark:text-white"
+              className="accent-focus w-full text-center tracking-[0.4em] rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/15 focus:outline-none px-4 py-3 text-lg text-slate-900 dark:text-white disabled:opacity-50"
             />
-            {pinError && <div className="text-xs text-rose-500">رمز القفل غير صحيح</div>}
+            {pinError && (
+              <div className="text-xs text-rose-500">
+                {pinLockoutSeconds > 0
+                  ? `محاولات خاطئة متكررة. انتظر ${pinLockoutSeconds} ثانية قبل المحاولة مجددًا.`
+                  : pinError}
+              </div>
+            )}
             <button
               type="submit"
-              className="accent-btn w-full py-3 rounded-xl text-white text-sm font-semibold cursor-pointer"
+              disabled={pinLockoutSeconds > 0}
+              className="accent-btn w-full py-3 rounded-xl text-white text-sm font-semibold cursor-pointer disabled:opacity-50"
             >
-              فتح الواجهة
+              {pinLockoutSeconds > 0 ? `محظور مؤقتًا (${pinLockoutSeconds}ث)` : 'فتح الواجهة'}
             </button>
             <button
               type="button"
@@ -447,7 +587,7 @@ function NovaApplication() {
               {/* Zone 3: Install App Button + Optional Quick Lock + Settings Gear Icon */}
               <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
                 <PWAInstallButton variant="header" />
-                {savedPin && (
+                {savedPinHash && (
                   <button
                     type="button"
                     onClick={() => setIsScreenLocked(true)}
@@ -469,7 +609,16 @@ function NovaApplication() {
                       : 'bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border-transparent text-slate-700 dark:text-slate-200'
                   }`}
                 >
-                  <Settings className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+                  {resolvedAvatarUrl ? (
+                    <img
+                      src={resolvedAvatarUrl}
+                      alt={user.displayName || 'حسابي'}
+                      referrerPolicy="no-referrer"
+                      className="w-5 h-5 rounded-full object-cover shrink-0"
+                    />
+                  ) : (
+                    <Settings className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+                  )}
                   <span className="hidden sm:inline">الإعدادات</span>
                 </button>
               </div>
@@ -531,6 +680,22 @@ function NovaApplication() {
                       );
                     })}
 
+                    <button
+                      type="button"
+                      onClick={() => navigateTo('faq')}
+                      className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                        activeTab === 'faq'
+                          ? 'accent-active-tab text-slate-900 dark:text-white'
+                          : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
+                      }`}
+                    >
+                      <HelpCircle
+                        className="w-4 h-4 shrink-0"
+                        style={activeTab === 'faq' ? { color: 'var(--accent-primary)' } : undefined}
+                      />
+                      <span>أسئلة شائعة</span>
+                    </button>
+
                     {isOwner && (
                       <button
                         type="button"
@@ -571,12 +736,22 @@ function NovaApplication() {
                   </nav>
 
                   {/* Drawer Footer User Info */}
-                  <div className="p-4 border-t border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-[#050814]/80">
-                    <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
-                      {user.displayName || 'Nova User'}
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate mt-0.5" dir="ltr">
-                      {user.email}
+                  <div className="p-4 border-t border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-[#050814]/80 flex items-center gap-3">
+                    {resolvedAvatarUrl && (
+                      <img
+                        src={resolvedAvatarUrl}
+                        alt={user.displayName || 'Nova User'}
+                        referrerPolicy="no-referrer"
+                        className="w-9 h-9 rounded-full object-cover shrink-0 border border-white/15"
+                      />
+                    )}
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                        {user.displayName || 'Nova User'}
+                      </div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate mt-0.5" dir="ltr">
+                        {user.email}
+                      </div>
                     </div>
                   </div>
                 </motion.aside>
@@ -607,9 +782,21 @@ function NovaApplication() {
                 {activeTab === 'chat' && (
                   <ChatWorkspace
                     user={user}
+                    userAvatarUrl={resolvedAvatarUrl}
                     customInstruction={customInstruction}
                     draftPrompt={draftPrompt}
                     onConsumeDraftPrompt={() => setDraftPrompt(null)}
+                    onOpenPresentation={(topic) => {
+                      if (topic) setPptxTopicDraft(topic);
+                      navigateTo('pptx');
+                    }}
+                  />
+                )}
+                {activeTab === 'pptx' && (
+                  <PresentationStudio
+                    user={user}
+                    initialTopic={pptxTopicDraft}
+                    onConsumeInitialTopic={() => setPptxTopicDraft(null)}
                   />
                 )}
                 {activeTab === 'about' && (
@@ -626,6 +813,7 @@ function NovaApplication() {
                     }}
                     onGoToSettings={openSettings}
                     onGoToContact={() => navigateTo('contact')}
+                    onGoToFaq={() => navigateTo('faq')}
                   />
                 )}
                 {activeTab === 'faq' && (
@@ -648,12 +836,19 @@ function NovaApplication() {
                   <SettingsPage
                     userEmail={user.email || ''}
                     displayName={user.displayName || 'Nova User'}
+                    avatarUrl={resolvedAvatarUrl}
+                    hasCustomAvatar={Boolean(customAvatarUrl)}
                     themeMode={themeMode}
                     accentColor={accentColor}
+                    backgroundStyle={backgroundStyle}
+                    fontColor={fontColor}
                     customInstruction={customInstruction}
-                    hasPin={Boolean(savedPin)}
+                    hasPin={Boolean(savedPinHash)}
                     onChangeTheme={handleChangeTheme}
                     onChangeAccent={handleChangeAccent}
+                    onChangeBackground={handleChangeBackground}
+                    onChangeFontColor={handleChangeFontColor}
+                    onUpdateAvatar={handleUpdateAvatar}
                     onSaveInstruction={handleSaveInstruction}
                     onUpdatePin={handleUpdatePin}
                     onSwitchAccount={handleSwitchAccount}

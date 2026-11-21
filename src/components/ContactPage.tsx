@@ -30,6 +30,7 @@ import {
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { NovaStarLogo } from './NovaStarLogo';
+import { getOtpHeaders } from '../lib/otpSession';
 
 type MessageCategory = 'issue' | 'suggestion' | 'general';
 type TriageLevel = 'pending' | 'simple' | 'urgent';
@@ -156,6 +157,7 @@ export function ContactPage({ user, onGoToChat, onGoToOwnerDashboard }: ContactP
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${idToken}`,
+            ...getOtpHeaders(),
           },
           body: JSON.stringify(payload),
           signal: controller.signal,

@@ -14,12 +14,18 @@
     --accent-border: rgba(139, 92, 246, 0.35);
     --accent-glow: rgba(124, 58, 237, 0.35);
     --accent-text: #a78bfa;
+
+    /* Custom Background & Font Color */
+    --app-bg-color: #050711;
+    --app-text-color: #f1f5f9;
   }
 
   html, body {
     font-family: var(--font-sans);
     overflow-x: hidden;
     max-width: 100%;
+    background-color: var(--app-bg-color);
+    color: var(--app-text-color);
   }
 
   html.dark {
@@ -37,6 +43,14 @@
   code, pre, .font-mono {
     font-family: var(--font-mono);
   }
+}
+
+/* When user explicitly selects a custom font color (other than auto), apply across primary headings & reading text */
+html[data-font-color]:not([data-font-color="auto"]) main h1,
+html[data-font-color]:not([data-font-color="auto"]) main h2,
+html[data-font-color]:not([data-font-color="auto"]) main h3,
+html[data-font-color]:not([data-font-color="auto"]) .nova-themed-text {
+  color: var(--app-text-color) !important;
 }
 
 .accent-btn {

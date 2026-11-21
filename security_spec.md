@@ -8,6 +8,7 @@
 5. **No Shadow Fields**: Every create checks `keys().hasAll(...)` and `keys().hasOnly(...)`, and every update uses `affectedKeys().hasOnly(...)` paired with the entity validator `isValid[Entity](incoming())`.
 6. **Path ID & String Size Guard**: All document IDs are validated with `isValidId()` (`<= 128` chars, `^[a-zA-Z0-9_-]+$`), and every string field enforces explicit `.size()` bounds.
 7. **Admin Analytics Isolation**: Only `isAdmin()` (`amjad.alqasmi67@gmail.com` with `email_verified == true`) can `list` `/users` for new-user growth charts and `list` `/visitLogs` for daily visit charts. Regular users can only create `/visitLogs/{visitId}` for their own `uid` with `createdAt == request.time`, valid `dateKey` (`YYYY-MM-DD`), and `deviceType` in `['mobile', 'tablet', 'desktop']`.
+8. **Profile Customization, Verified Email & Avatar Guard**: `/users/{userId}` enforces `data.email == request.auth.token.email` and optionally accepts `accentColor` (`['violet', 'blue', 'emerald', 'rose', 'amber']`), `backgroundStyle`, `fontColor`, and `avatarDataUrl` (`<= 65000` bytes, strictly matching safe base64 `data:image/(jpeg|png|webp);base64,...` or empty string).
 
 ## 2. Adversarial Test Payloads ("Dirty Dozen")
 1. Cross-user read on `/users/{otherUid}` -> `PERMISSION_DENIED`

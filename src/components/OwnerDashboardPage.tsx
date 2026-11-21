@@ -22,9 +22,14 @@ import {
   Lock,
   ArrowRight,
   BarChart3,
+  Shield,
+  RefreshCw,
+  MailCheck,
+  Ban,
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { OwnerAnalyticsDashboard } from './OwnerAnalyticsDashboard';
+import { getOtpHeaders } from '../lib/otpSession';
 
 export const OWNER_ADMIN_EMAIL = 'amjad.alqasmi67@gmail.com';
 
@@ -56,6 +61,38 @@ interface OwnerDashboardPageProps {
   onBackToChat: () => void;
 }
 
+type SecurityEventType =
+  | 'scanner_probe'
+  | 'traversal_block'
+  | 'csrf_origin_block'
+  | 'prototype_pollution_block'
+  | 'auth_ban'
+  | 'otp_lockout';
+
+interface SecurityEventItem {
+  id: string;
+  type: SecurityEventType;
+  maskedIp: string;
+  path: string;
+  timestamp: number;
+}
+
+interface SecurityMonitorResponse {
+  otpConfigured: boolean;
+  activeBannedIps: number;
+  totalBlockedEvents: number;
+  recentEvents: SecurityEventItem[];
+}
+
+const SECURITY_EVENT_LABELS: Record<SecurityEventType, string> = {
+  scanner_probe: 'فحص ثغرات أو مسار مشبوه',
+  traversal_block: 'محاولة اختراق مسارات (Traversal)',
+  csrf_origin_block: 'طلب من مصدر غير موثوق (CSRF)',
+  prototype_pollution_block: 'حقول بيانات ضارة (Injection)',
+  auth_ban: 'حظر مؤقت لمحاولات دخول متكررة',
+  otp_lockout: 'قفل تحقق رمز Gmail بعد أخطاء متكررة',
+};
+
 const CATEGORY_LABELS: Record<MessageCategory, string> = {
   issue: 'مشكلة تقنية',
   suggestion: 'اقتراح تطوير',
@@ -67,10 +104,13 @@ export function OwnerDashboardPage({ user, onBackToChat }: OwnerDashboardPagePro
 
   const [records, setRecords] = useState<ContactMessageRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeSection, setActiveSection] = useState<'analytics' | 'messages'>('analytics');
+  const [activeSection, setActiveSection] = useState<'analytics' | 'messages' | 'security'>('analytics');
   const [filter, setFilter] = useState<DashboardFilter>('urgent');
   const [categoryFilter, setCategoryFilter] = useState<'all' | MessageCategory>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [securityData, setSecurityData] = useState<SecurityMonitorResponse | null>(null);
+  const [securityLoading, setSecurityLoading] = useState(false);
+  const [securityError, setSecurityError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!authorized) {
@@ -123,6 +163,37 @@ export function OwnerDashboardPage({ user, onBackToChat }: OwnerDashboardPagePro
 
     return () => unsubscribe();
   }, [authorized]);
+
+  const fetchSecurityEvents = async () => {
+    if (!authorized) return;
+    setSecurityLoading(true);
+    setSecurityError(null);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch('/api/owner/security-events', {
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          ...getOtpHeaders(),
+        },
+      });
+      const data = (await res.json()) as SecurityMonitorResponse & { error?: string };
+      if (!res.ok) {
+        throw new Error(data.error || 'تعذر تحميل سجل الحماية حاليًا.');
+      }
+      setSecurityData(data);
+    } catch (err) {
+      setSecurityError(err instanceof Error ? err.message : 'تعذر تحميل سجل الحماية.');
+    } finally {
+      setSecurityLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (authorized && activeSection === 'security') {
+      fetchSecurityEvents();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authorized, activeSection]);
 
   if (!authorized) {
     return (
@@ -268,6 +339,19 @@ export function OwnerDashboardPage({ user, onBackToChat }: OwnerDashboardPagePro
             </span>
           )}
         </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSection('security')}
+          className={`flex-1 sm:flex-initial inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-colors cursor-pointer border whitespace-nowrap ${
+            activeSection === 'security'
+              ? 'accent-active-tab text-slate-900 dark:text-white'
+              : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+          }`}
+        >
+          <Shield className="w-4 h-4 shrink-0" style={activeSection === 'security' ? { color: 'var(--accent-primary)' } : undefined} />
+          <span>الحماية والمراقبة</span>
+        </button>
       </div>
 
       {/* Urgent Alert Banner if active urgent messages exist */}
@@ -301,6 +385,144 @@ export function OwnerDashboardPage({ user, onBackToChat }: OwnerDashboardPagePro
 
       {activeSection === 'analytics' ? (
         <OwnerAnalyticsDashboard />
+      ) : activeSection === 'security' ? (
+        <div className="space-y-5">
+          {/* Security Summary Cards */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-5 space-y-2 backdrop-blur-md">
+              <div className="flex items-center justify-between text-xs font-semibold text-slate-600 dark:text-slate-300">
+                <span>التحقق الثنائي عبر Gmail (OTP)</span>
+                <MailCheck className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+              </div>
+              {securityData?.otpConfigured ? (
+                <>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/35 text-xs font-bold text-emerald-700 dark:text-emerald-300">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>مفعّل ومطلوب عند تسجيل الدخول</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                    يرسل رمزًا مكونًا من 6 أرقام إلى بريد المستخدم في Gmail قبل السماح بدخول التطبيق أو استخدام الذكاء الاصطناعي.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/35 text-xs font-bold text-amber-700 dark:text-amber-300">
+                    <Clock className="w-3.5 h-3.5" />
+                    <span>جاهز للتفعيل عبر إعدادات البيئة</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                    لتفعيل إرسال الرمز إلى Gmail تلقائيًا، أضف{' '}
+                    <span dir="ltr" className="font-mono font-semibold text-slate-700 dark:text-slate-200">
+                      SMTP_USER
+                    </span>{' '}
+                    و{' '}
+                    <span dir="ltr" className="font-mono font-semibold text-slate-700 dark:text-slate-200">
+                      SMTP_PASS
+                    </span>{' '}
+                    أو{' '}
+                    <span dir="ltr" className="font-mono font-semibold text-slate-700 dark:text-slate-200">
+                      RESEND_API_KEY
+                    </span>{' '}
+                    داخل Settings &gt; Secrets.
+                  </p>
+                </>
+              )}
+            </div>
+
+            <div className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-5 space-y-2 backdrop-blur-md">
+              <div className="flex items-center justify-between text-xs font-semibold text-slate-600 dark:text-slate-300">
+                <span>عناوين IP المحظورة حاليًا</span>
+                <Ban className="w-4 h-4 text-rose-500" />
+              </div>
+              <div className="text-3xl font-bold text-slate-900 dark:text-white tabular-nums">
+                {securityData?.activeBannedIps ?? 0}
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                حظر تلقائي فوري لأي شخص مشبوه يحاول فحص الثغرات أو تخمين الدخول.
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-5 space-y-2 backdrop-blur-md">
+              <div className="flex items-center justify-between text-xs font-semibold text-slate-600 dark:text-slate-300">
+                <span>محاولات مشبوهة تم صدها</span>
+                <ShieldCheck className="w-4 h-4 text-emerald-500" />
+              </div>
+              <div className="text-3xl font-bold text-slate-900 dark:text-white tabular-nums">
+                {securityData?.totalBlockedEvents ?? 0}
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                يراقب جدار الحماية المسارات الحساسة وأدوات الاختراق وهجمات CSRF و XSS.
+              </p>
+            </div>
+          </div>
+
+          {/* Recent Blocked Suspicious Events */}
+          <div className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-5 space-y-4 backdrop-blur-md">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-base font-bold text-slate-900 dark:text-white">
+                <ShieldAlert className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+                <span>سجل الأنشطة المشبوهة المحظورة</span>
+              </div>
+              <button
+                type="button"
+                onClick={fetchSecurityEvents}
+                disabled={securityLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#060916] border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:border-slate-300 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${securityLoading ? 'animate-spin' : ''}`} />
+                <span>تحديث السجل</span>
+              </button>
+            </div>
+
+            {securityError && (
+              <div className="rounded-xl bg-rose-500/10 border border-rose-500/35 px-4 py-3 text-xs text-rose-700 dark:text-rose-200">
+                {securityError}
+              </div>
+            )}
+
+            {securityLoading && !securityData ? (
+              <div className="py-10 text-center text-xs text-slate-500 dark:text-slate-400">
+                جاري فحص سجلات الحماية...
+              </div>
+            ) : !securityData || securityData.recentEvents.length === 0 ? (
+              <div className="py-10 px-4 rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/10 text-center space-y-1.5">
+                <ShieldCheck className="w-7 h-7 mx-auto text-emerald-500" />
+                <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                  الوضع آمن — لم تُسجل أي محاولات مشبوهة مؤخرًا
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  أي محاولة فحص أو اختراق سيتم حظرها فورًا وتسجيلها هنا تلقائيًا.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {securityData.recentEvents.map((ev) => (
+                  <div
+                    key={ev.id}
+                    className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3.5 rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/10"
+                  >
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2 py-0.5 rounded-md bg-rose-500/15 border border-rose-500/35 text-rose-700 dark:text-rose-300 text-[11px] font-bold">
+                          {SECURITY_EVENT_LABELS[ev.type] || ev.type}
+                        </span>
+                        <span dir="ltr" className="font-mono text-xs text-slate-600 dark:text-slate-300">
+                          {ev.maskedIp}
+                        </span>
+                      </div>
+                      <div dir="ltr" className="font-mono text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                        {ev.path}
+                      </div>
+                    </div>
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400 shrink-0">
+                      {formatDate(ev.timestamp)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       ) : (
         <>
 

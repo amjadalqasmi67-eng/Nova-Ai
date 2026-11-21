@@ -1,4 +1,4 @@
-import { useState, FormEvent } from 'react';
+import { useState, useRef, FormEvent, ChangeEvent } from 'react';
 import {
   ArrowRight,
   Sun,
@@ -11,19 +11,40 @@ import {
   Lock,
   Check,
   Sparkles,
+  Camera,
+  Upload,
+  Trash2,
+  Type as TypeIcon,
+  Image as ImageIcon,
 } from 'lucide-react';
-import { ACCENT_PRESETS, AccentColor, ThemeMode } from '../lib/theme';
+import {
+  ACCENT_PRESETS,
+  BACKGROUND_PRESETS,
+  FONT_COLOR_PRESETS,
+  AccentColor,
+  BackgroundStyle,
+  FontColor,
+  ThemeMode,
+} from '../lib/theme';
+import { compressAvatarFile } from '../lib/imageUtils';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface SettingsPageProps {
   userEmail: string;
   displayName: string;
+  avatarUrl: string | null;
+  hasCustomAvatar: boolean;
   themeMode: ThemeMode;
   accentColor: AccentColor;
+  backgroundStyle: BackgroundStyle;
+  fontColor: FontColor;
   customInstruction: string;
   hasPin: boolean;
   onChangeTheme: (mode: ThemeMode) => void;
   onChangeAccent: (color: AccentColor) => void;
+  onChangeBackground: (bg: BackgroundStyle) => void;
+  onChangeFontColor: (fontColor: FontColor) => void;
+  onUpdateAvatar: (avatarDataUrl: string) => Promise<void>;
   onSaveInstruction: (instruction: string) => Promise<void>;
   onUpdatePin: (pin: string | null) => void;
   onSwitchAccount: () => Promise<void>;
@@ -31,17 +52,33 @@ interface SettingsPageProps {
   onBack: () => void;
 }
 
-const COLOR_ORDER: AccentColor[] = ['violet', 'blue', 'emerald', 'rose'];
+const COLOR_ORDER: AccentColor[] = ['violet', 'blue', 'emerald', 'rose', 'amber'];
+const BG_ORDER: BackgroundStyle[] = [
+  'cosmos',
+  'midnight-violet',
+  'forest-emerald',
+  'crimson-night',
+  'golden-amber',
+  'clean',
+];
+const FONT_COLOR_ORDER: FontColor[] = ['auto', 'violet', 'emerald', 'rose', 'amber', 'blue'];
 
 export function SettingsPage({
   userEmail,
   displayName,
+  avatarUrl,
+  hasCustomAvatar,
   themeMode,
   accentColor,
+  backgroundStyle,
+  fontColor,
   customInstruction,
   hasPin,
   onChangeTheme,
   onChangeAccent,
+  onChangeBackground,
+  onChangeFontColor,
+  onUpdateAvatar,
   onSaveInstruction,
   onUpdatePin,
   onSwitchAccount,
@@ -51,8 +88,53 @@ export function SettingsPage({
   const [instruction, setInstruction] = useState(customInstruction);
   const [pinInput, setPinInput] = useState('');
   const [saving, setSaving] = useState(false);
+  const [updatingAvatar, setUpdatingAvatar] = useState(false);
   const [switchingAccount, setSwitchingAccount] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const avatarFileRef = useRef<HTMLInputElement | null>(null);
+  const avatarCameraRef = useRef<HTMLInputElement | null>(null);
+
+  const handleAvatarSelected = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setFeedback({ type: 'err', text: 'يرجى اختيار ملف صورة صالح لحسابك.' });
+      return;
+    }
+
+    setUpdatingAvatar(true);
+    setFeedback(null);
+    try {
+      const compressedDataUrl = await compressAvatarFile(file);
+      await onUpdateAvatar(compressedDataUrl);
+      setFeedback({ type: 'ok', text: 'تم تحديث صورة حسابك وحفظها بنجاح.' });
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'تعذر تحديث صورة الحساب.',
+      });
+    } finally {
+      setUpdatingAvatar(false);
+    }
+  };
+
+  const handleRemoveAvatar = async () => {
+    setUpdatingAvatar(true);
+    setFeedback(null);
+    try {
+      await onUpdateAvatar('');
+      setFeedback({ type: 'ok', text: 'تمت إزالة الصورة المخصصة بنجاح.' });
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'تعذر إزالة الصورة.',
+      });
+    } finally {
+      setUpdatingAvatar(false);
+    }
+  };
 
   const handleSavePreferences = async (e: FormEvent) => {
     e.preventDefault();
@@ -97,7 +179,7 @@ export function SettingsPage({
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-white">إعدادات Nova AI</h1>
           <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-1">
-            تحكم في ألوان الواجهة، الوضع الداكن والفاتح، وإعدادات حسابك الشخصي.
+            تحكم في صورة الحساب، الخلفية، ألوان الخطوط والأزرار، وإعدادات حسابك الشخصي.
           </p>
         </div>
         <button
@@ -110,7 +192,106 @@ export function SettingsPage({
         </button>
       </div>
 
-      {/* Section 1: Theme Mode & Accent Colors */}
+      {/* Section 1: Account Photo & Management */}
+      <section className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-4 sm:p-6 backdrop-blur-md space-y-4">
+        <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+          <UserCheck className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+          <span>صورة الحساب وإدارته</span>
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/10">
+          <div className="flex items-center gap-4 min-w-0">
+            {avatarUrl ? (
+              <img
+                src={avatarUrl}
+                alt={displayName}
+                referrerPolicy="no-referrer"
+                className="w-16 h-16 rounded-full object-cover border-2 shrink-0 shadow-sm"
+                style={{ borderColor: 'var(--accent-primary)' }}
+              />
+            ) : (
+              <div className="accent-btn w-16 h-16 rounded-full text-white flex items-center justify-center text-xl font-bold shrink-0">
+                {displayName.slice(0, 1)}
+              </div>
+            )}
+
+            <div className="min-w-0">
+              <div className="text-sm font-bold text-slate-900 dark:text-white truncate">{displayName}</div>
+              <div className="text-xs text-slate-600 dark:text-slate-400 font-mono mt-0.5 break-all" dir="ltr">
+                {userEmail}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 mt-2.5">
+                <input
+                  ref={avatarFileRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleAvatarSelected}
+                  className="hidden"
+                />
+                <input
+                  ref={avatarCameraRef}
+                  type="file"
+                  accept="image/*"
+                  capture="user"
+                  onChange={handleAvatarSelected}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  disabled={updatingAvatar}
+                  onClick={() => avatarFileRef.current?.click()}
+                  className="accent-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{updatingAvatar ? 'جاري الرفع...' : 'رفع صورة للحساب'}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={updatingAvatar}
+                  onClick={() => avatarCameraRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white dark:bg-[#111936] border border-slate-200 dark:border-white/15 text-xs font-semibold text-slate-800 dark:text-slate-100 cursor-pointer disabled:opacity-50"
+                >
+                  <Camera className="w-3.5 h-3.5" />
+                  <span>التقاط صورة</span>
+                </button>
+                {hasCustomAvatar && (
+                  <button
+                    type="button"
+                    disabled={updatingAvatar}
+                    onClick={handleRemoveAvatar}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/10 border border-rose-500/25 text-xs font-semibold text-rose-600 dark:text-rose-300 cursor-pointer disabled:opacity-50"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>إزالة</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={handleSwitch}
+              disabled={switchingAccount}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white dark:bg-[#111936] border border-slate-200 dark:border-white/15 hover:border-slate-300 dark:hover:border-white/30 text-xs font-semibold text-slate-800 dark:text-slate-100 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${switchingAccount ? 'animate-spin' : ''}`} />
+              <span>تغيير الحساب</span>
+            </button>
+            <button
+              type="button"
+              onClick={onSignOut}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-xs font-semibold text-rose-600 dark:text-rose-300 transition-colors cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>تسجيل الخروج</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 2: Theme Mode, Background Style, Accent Colors & Font Colors */}
       <section className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-4 sm:p-6 space-y-6 backdrop-blur-md">
         {/* Dark / Light Switch */}
         <div>
@@ -139,7 +320,7 @@ export function SettingsPage({
                 </div>
                 <div className="text-right">
                   <div className="text-sm font-semibold">الوضع الداكن</div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">خلفية فضائية عميقة مريحة للعين</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">إضاءة ليلية مريحة للعين</div>
                 </div>
               </div>
               {themeMode === 'dark' && <Check className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />}
@@ -168,17 +349,102 @@ export function SettingsPage({
           </div>
         </div>
 
+        {/* Background Style Selector */}
+        <div className="pt-5 border-t border-slate-200 dark:border-white/10">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white mb-1">
+            <ImageIcon className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+            <span>لون ونمط الخلفية</span>
+          </div>
+          <p className="text-xs text-slate-600 dark:text-slate-400 mb-4">
+            غيّر خلفية التطبيق بالكامل باللون والأجواء التي تفضلها.
+          </p>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {BG_ORDER.map((bgKey) => {
+              const preset = BACKGROUND_PRESETS[bgKey];
+              const isSelected = backgroundStyle === bgKey;
+              return (
+                <button
+                  key={bgKey}
+                  type="button"
+                  onClick={() => onChangeBackground(bgKey)}
+                  className={`flex items-center justify-between gap-2 p-3.5 rounded-xl border transition-all cursor-pointer ${
+                    isSelected
+                      ? 'border-slate-900 dark:border-white bg-slate-100 dark:bg-white/10 shadow-sm'
+                      : 'border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-[#060916] hover:border-slate-300 dark:hover:border-white/25'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span
+                      className="w-6 h-6 rounded-lg shrink-0 border border-white/20 shadow-sm"
+                      style={{ backgroundImage: preset.swatch }}
+                    />
+                    <span className="text-xs sm:text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                      {preset.label}
+                    </span>
+                  </div>
+                  {isSelected && <Check className="w-4 h-4 text-slate-900 dark:text-white shrink-0" />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Font Color Selector */}
+        <div className="pt-5 border-t border-slate-200 dark:border-white/10">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white mb-1">
+            <TypeIcon className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+            <span>ألوان الخطوط والنصوص</span>
+          </div>
+          <p className="text-xs text-slate-600 dark:text-slate-400 mb-4">
+            اختر لون الخطوط والعناوين في المحادثة وصفحات التطبيق (بنفسجي، أخضر، أحمر، أصفر، أزرق، أو تلقائي).
+          </p>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {FONT_COLOR_ORDER.map((fcKey) => {
+              const preset = FONT_COLOR_PRESETS[fcKey];
+              const isSelected = fontColor === fcKey;
+              return (
+                <button
+                  key={fcKey}
+                  type="button"
+                  onClick={() => onChangeFontColor(fcKey)}
+                  className={`flex items-center justify-between gap-2 p-3.5 rounded-xl border transition-all cursor-pointer ${
+                    isSelected
+                      ? 'border-slate-900 dark:border-white bg-slate-100 dark:bg-white/10 shadow-sm'
+                      : 'border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-[#060916] hover:border-slate-300 dark:hover:border-white/25'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span
+                      className="w-6 h-6 rounded-full shrink-0 border border-black/15 shadow-sm"
+                      style={{ background: preset.swatch }}
+                    />
+                    <span
+                      className="text-xs sm:text-sm font-bold truncate"
+                      style={{ color: themeMode === 'dark' ? preset.darkText : preset.lightText }}
+                    >
+                      {preset.label}
+                    </span>
+                  </div>
+                  {isSelected && <Check className="w-4 h-4 text-slate-900 dark:text-white shrink-0" />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
         {/* Accent Color Selector */}
         <div className="pt-5 border-t border-slate-200 dark:border-white/10">
           <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white mb-1">
             <Palette className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
-            <span>لون الواجهة الرئيسي</span>
+            <span>لون الأزرار والواجهة الرئيسي</span>
           </div>
           <p className="text-xs text-slate-600 dark:text-slate-400 mb-4">
             يُحفظ اللون المختار تلقائيًا ويُطبّق على الأزرار والتبويبات واللمسات التفاعلية.
           </p>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             {COLOR_ORDER.map((key) => {
               const preset = ACCENT_PRESETS[key];
               const isSelected = accentColor === key;
@@ -193,14 +459,16 @@ export function SettingsPage({
                       : 'border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-[#060916] hover:border-slate-300 dark:hover:border-white/25'
                   }`}
                 >
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex items-center gap-2 min-w-0">
                     <span
-                      className="w-6 h-6 rounded-full shrink-0 shadow-sm"
+                      className="w-5 h-5 rounded-full shrink-0 shadow-sm"
                       style={{
                         backgroundImage: `linear-gradient(135deg, ${preset.primary}, ${preset.secondary})`,
                       }}
                     />
-                    <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">{preset.label}</span>
+                    <span className="text-xs sm:text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                      {preset.label}
+                    </span>
                   </div>
                   {isSelected && <Check className="w-4 h-4 text-slate-900 dark:text-white shrink-0" />}
                 </button>
@@ -210,7 +478,7 @@ export function SettingsPage({
         </div>
       </section>
 
-      {/* Section 2: Install App on Any Device (PWA) */}
+      {/* Section 3: Install App on Any Device (PWA) */}
       <section className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-4 sm:p-6 backdrop-blur-md space-y-3">
         <div className="text-sm font-bold text-slate-900 dark:text-white">
           تثبيت التطبيق على أجهزتك
@@ -218,44 +486,7 @@ export function SettingsPage({
         <PWAInstallButton variant="card" />
       </section>
 
-      {/* Section 3: Account Management */}
-      <section className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-4 sm:p-6 backdrop-blur-md">
-        <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white mb-4">
-          <UserCheck className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
-          <span>إدارة الحساب</span>
-        </div>
-
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/10">
-          <div className="min-w-0">
-            <div className="text-sm font-bold text-slate-900 dark:text-white truncate">{displayName}</div>
-            <div className="text-xs text-slate-600 dark:text-slate-400 font-mono mt-0.5 break-all" dir="ltr">
-              {userEmail}
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2.5">
-            <button
-              type="button"
-              onClick={handleSwitch}
-              disabled={switchingAccount}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white dark:bg-[#111936] border border-slate-200 dark:border-white/15 hover:border-slate-300 dark:hover:border-white/30 text-xs font-semibold text-slate-800 dark:text-slate-100 transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${switchingAccount ? 'animate-spin' : ''}`} />
-              <span>تغيير الحساب</span>
-            </button>
-            <button
-              type="button"
-              onClick={onSignOut}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-xs font-semibold text-rose-600 dark:text-rose-300 transition-colors cursor-pointer"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>تسجيل الخروج</span>
-            </button>
-          </div>
-        </div>
-      </section>
-
-      {/* Section 3: AI Persona & Quick PIN Lock */}
+      {/* Section 4: AI Persona & Quick PIN Lock */}
       <form
         onSubmit={handleSavePreferences}
         className="rounded-2xl bg-white/90 dark:bg-[#0B1020]/90 border border-slate-200 dark:border-white/10 p-4 sm:p-6 space-y-5 backdrop-blur-md"

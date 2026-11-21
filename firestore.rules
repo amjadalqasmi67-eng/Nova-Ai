@@ -32,7 +32,19 @@ service cloud.firestore {
 
     function isValidUserProfile(data, userId) {
       return data.keys().hasAll(['uid', 'displayName', 'email', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['uid', 'displayName', 'email', 'customInstruction', 'accentColor', 'themeMode', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid',
+          'displayName',
+          'email',
+          'customInstruction',
+          'accentColor',
+          'themeMode',
+          'backgroundStyle',
+          'fontColor',
+          'avatarDataUrl',
+          'createdAt',
+          'updatedAt'
+        ])
         && data.uid is string
         && data.uid == userId
         && data.uid == request.auth.uid
@@ -43,9 +55,17 @@ service cloud.firestore {
         && data.email is string
         && data.email.size() >= 3
         && data.email.size() <= 200
+        && data.email == request.auth.token.email
         && (!('customInstruction' in data) || (data.customInstruction is string && data.customInstruction.size() <= 1000))
-        && (!('accentColor' in data) || (data.accentColor in ['violet', 'blue', 'emerald', 'rose']))
+        && (!('accentColor' in data) || (data.accentColor in ['violet', 'blue', 'emerald', 'rose', 'amber']))
         && (!('themeMode' in data) || (data.themeMode in ['dark', 'light']))
+        && (!('backgroundStyle' in data) || (data.backgroundStyle in ['cosmos', 'midnight-violet', 'forest-emerald', 'crimson-night', 'golden-amber', 'clean']))
+        && (!('fontColor' in data) || (data.fontColor in ['auto', 'violet', 'emerald', 'rose', 'amber', 'blue']))
+        && (!('avatarDataUrl' in data) || (
+          data.avatarDataUrl is string
+          && data.avatarDataUrl.size() <= 65000
+          && (data.avatarDataUrl.size() == 0 || data.avatarDataUrl.matches('^data:image/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$'))
+        ))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -134,7 +154,17 @@ service cloud.firestore {
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'customInstruction', 'accentColor', 'themeMode', 'updatedAt']);
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'email',
+          'customInstruction',
+          'accentColor',
+          'themeMode',
+          'backgroundStyle',
+          'fontColor',
+          'avatarDataUrl',
+          'updatedAt'
+        ]);
       allow delete: if isValidId(userId) && isOwner(userId);
 
       match /conversations/{conversationId} {

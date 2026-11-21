@@ -4,6 +4,11 @@ import {
   Plus,
   Trash2,
   Paperclip,
+  Camera,
+  Mic,
+  Volume2,
+  Square,
+  Presentation,
   X,
   MessageSquare,
   Menu,
@@ -26,8 +31,12 @@ import {
   Timestamp,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
+import { CompressedImage, compressImageFile } from '../lib/imageUtils';
 import { MarkdownMessage } from './MarkdownMessage';
 import { NovaStarLogo } from './NovaStarLogo';
+import { CameraCaptureModal } from './CameraCaptureModal';
+import { LiveVoiceModal } from './LiveVoiceModal';
+import { getOtpHeaders } from '../lib/otpSession';
 
 interface Conversation {
   id: string;
@@ -50,9 +59,11 @@ interface ChatMessage {
 
 interface ChatWorkspaceProps {
   user: User;
+  userAvatarUrl?: string | null;
   customInstruction: string;
   draftPrompt?: string | null;
   onConsumeDraftPrompt?: () => void;
+  onOpenPresentation?: (topic?: string) => void;
 }
 
 const STARTER_PROMPTS = [
@@ -76,26 +87,35 @@ const STARTER_PROMPTS = [
 
 export function ChatWorkspace({
   user,
+  userAvatarUrl,
   customInstruction,
   draftPrompt,
   onConsumeDraftPrompt,
+  onOpenPresentation,
 }: ChatWorkspaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [thinkingDepth, setThinkingDepth] = useState<'low' | 'high'>('low');
-  const [attachment, setAttachment] = useState<{ data: string; mimeType: string; previewUrl: string } | null>(null);
+  const [attachment, setAttachment] = useState<CompressedImage | null>(null);
   const [isLoadingReply, setIsLoadingReply] = useState(false);
   const [streamingReply, setStreamingReply] = useState('');
   const [streamPhase, setStreamPhase] = useState<'generating' | 'thinking' | 'retrying'>('generating');
-  const [pendingUserMessage, setPendingUserMessage] = useState<ChatMessage | null>(null);
+  const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [cameraModalOpen, setCameraModalOpen] = useState(false);
+  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
+  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  const [loadingTtsId, setLoadingTtsId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeConversationIdRef = useRef<string | null>(null);
+  const firestoreQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
     if (draftPrompt) {
@@ -167,6 +187,12 @@ export function ChatWorkspace({
         });
         list.sort((a, b) => a.createdAtMs - b.createdAtMs);
         setMessages(list);
+        setPendingMessages((prev) => {
+          if (prev.length === 0) return prev;
+          const syncedIds = new Set(list.map((m) => m.id));
+          const remaining = prev.filter((m) => !syncedIds.has(m.id));
+          return remaining.length === prev.length ? prev : remaining;
+        });
       },
       (err) => {
         handleFirestoreError(err, OperationType.LIST, path);
@@ -178,112 +204,299 @@ export function ChatWorkspace({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: streamingReply ? 'auto' : 'smooth' });
-  }, [messages, pendingUserMessage, isLoadingReply, streamingReply]);
+  }, [messages, pendingMessages, isLoadingReply, streamingReply]);
 
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+  useEffect(() => {
+    return () => {
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     if (!file.type.startsWith('image/')) {
       setError('يمكن إرفاق ملفات الصور فقط في المحادثة.');
       return;
     }
-    if (file.size > 6 * 1024 * 1024) {
-      setError('حجم الصورة المرفقة يجب أن لا يتجاوز 6 ميجابايت.');
+
+    try {
+      const compressed = await compressImageFile(file);
+      setAttachment(compressed);
+      setError(null);
+    } catch {
+      setError('تعذر تجهيز الصورة. يرجى تجربة صورة أخرى.');
+    }
+  };
+
+  const handleToggleTts = async (msgId: string, content: string) => {
+    if (speakingMsgId === msgId) {
+      ttsAudioRef.current?.pause();
+      ttsAudioRef.current = null;
+      setSpeakingMsgId(null);
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || '');
-      const base64 = result.split(',')[1] || '';
-      setAttachment({
-        data: base64,
-        mimeType: file.type,
-        previewUrl: result,
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
+      setSpeakingMsgId(null);
+    }
+
+    setLoadingTtsId(msgId);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch('/api/nova/tts', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          ...getOtpHeaders(),
+        },
+        body: JSON.stringify({ text: content }),
       });
-      setError(null);
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
+      const data = (await res.json()) as { audioBase64?: string; mimeType?: string; error?: string };
+      if (!res.ok || !data.audioBase64 || !data.mimeType) {
+        throw new Error(data.error || 'تعذر تشغيل الصوت');
+      }
+      const audio = new Audio(`data:${data.mimeType};base64,${data.audioBase64}`);
+      ttsAudioRef.current = audio;
+      setSpeakingMsgId(msgId);
+      audio.onended = () => {
+        setSpeakingMsgId(null);
+        ttsAudioRef.current = null;
+      };
+      audio.onerror = () => {
+        setSpeakingMsgId(null);
+        ttsAudioRef.current = null;
+      };
+      await audio.play();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'تعذر قراءة الرد صوتيًا.');
+    } finally {
+      setLoadingTtsId(null);
+    }
+  };
+
+  const handleAppendVoiceTurns = (turns: Array<{ role: 'user' | 'assistant'; content: string }>) => {
+    if (turns.length === 0) return;
+    const existingConvId = activeConversationIdRef.current;
+    const isNewConv = !existingConvId;
+    const convId = existingConvId || crypto.randomUUID();
+    if (isNewConv) {
+      activeConversationIdRef.current = convId;
+    }
+
+    const nowBase = Date.now();
+    const mapped: ChatMessage[] = turns.map((t, idx) => ({
+      id: crypto.randomUUID(),
+      userId: user.uid,
+      conversationId: convId,
+      role: t.role,
+      content: t.content.slice(0, 20000),
+      hasAttachment: false,
+      createdAtMs: nowBase + idx,
+    }));
+
+    setPendingMessages((prev) => [...prev, ...mapped]);
+
+    const firstTitle = turns[0].content.slice(0, 60) || 'محادثة صوتية مع Nova AI';
+    const lastPreview = turns[turns.length - 1].content.slice(0, 120);
+
+    firestoreQueueRef.current = firestoreQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const convPath = `users/${user.uid}/conversations/${convId}`;
+        if (isNewConv) {
+          await setDoc(doc(db, convPath), {
+            userId: user.uid,
+            title: firstTitle,
+            lastMessagePreview: lastPreview,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          if (activeConversationIdRef.current === convId) {
+            setActiveConversationId(convId);
+          }
+        } else {
+          await updateDoc(doc(db, convPath), {
+            lastMessagePreview: lastPreview,
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        for (const item of mapped) {
+          await setDoc(doc(db, `users/${user.uid}/conversations/${convId}/messages/${item.id}`), {
+            userId: user.uid,
+            conversationId: convId,
+            role: item.role,
+            content: item.content,
+            hasAttachment: false,
+            createdAt: serverTimestamp(),
+          });
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to persist voice turns:', err);
+      });
+  };
+
+  const selectConversation = (convId: string | null) => {
+    activeConversationIdRef.current = convId;
+    setActiveConversationId(convId);
+    setPendingMessages([]);
+    setError(null);
   };
 
   const handleDeleteConversation = async (convId: string) => {
     const path = `users/${user.uid}/conversations/${convId}`;
     try {
       await deleteDoc(doc(db, path));
-      if (activeConversationId === convId) {
-        setActiveConversationId(null);
+      if (activeConversationIdRef.current === convId || activeConversationId === convId) {
+        selectConversation(null);
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, path);
     }
   };
 
-  const sendMessage = async (promptText?: string) => {
-    const text = (promptText ?? input).trim();
-    if (!text || isLoadingReply) return;
+  const sendMessage = async (promptText?: string, overrideAttachment?: CompressedImage) => {
+    if (isLoadingReply) return;
+    const currentAttachment = overrideAttachment ?? attachment;
+    const rawText = (promptText ?? input).trim();
+    const text = rawText || (currentAttachment ? 'حلّل هذه الصورة بالتفصيل واشرح ما يظهر فيها بدقة.' : '');
+    if (!text) return;
 
     setError(null);
-    const currentAttachment = attachment;
-    if (!promptText) {
+    if (!promptText && !overrideAttachment) {
       setInput('');
     }
-    setAttachment(null);
+    if (!overrideAttachment) {
+      setAttachment(null);
+    }
     setIsLoadingReply(true);
     setStreamingReply('');
-    setStreamPhase(thinkingDepth === 'high' ? 'thinking' : 'generating');
+    setStreamPhase(thinkingDepth === 'high' || currentAttachment ? 'thinking' : 'generating');
 
-    const existingConvId = activeConversationId;
+    const existingConvId = activeConversationIdRef.current;
+    const isNewConversation = !existingConvId;
     const convId = existingConvId || crypto.randomUUID();
+    if (isNewConversation) {
+      activeConversationIdRef.current = convId;
+    }
+
     const userMsgId = crypto.randomUUID();
+    const userMsgContent = text.slice(0, 20000);
 
-    setPendingUserMessage({
-      id: userMsgId,
-      userId: user.uid,
-      conversationId: convId,
-      role: 'user',
-      content: text.slice(0, 20000),
-      hasAttachment: Boolean(currentAttachment),
-      createdAtMs: Date.now(),
-    });
+    const combinedPrior = [
+      ...messages,
+      ...pendingMessages.filter(
+        (pm) => pm.conversationId === convId && !messages.some((m) => m.id === pm.id)
+      ),
+    ];
 
-    const historySnapshot = messages
+    const historySnapshot = combinedPrior
       .filter((m) => m.id !== userMsgId)
-      .slice(-14)
+      .slice(-7)
       .map((m) => ({
         role: m.role,
-        content: m.content,
+        content: m.content.slice(0, 2500),
       }));
 
-    // Run Firestore persistence concurrently so Gemini streaming begins without sequential delay
-    const firestoreWritePromise = (async () => {
-      const convPath = `users/${user.uid}/conversations/${convId}`;
-      if (!existingConvId) {
-        await setDoc(doc(db, convPath), {
-          userId: user.uid,
-          title: text.slice(0, 60),
-          lastMessagePreview: text.slice(0, 120),
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        setActiveConversationId(convId);
-      } else {
-        await updateDoc(doc(db, convPath), {
-          lastMessagePreview: text.slice(0, 120),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      const userMsgPath = `users/${user.uid}/conversations/${convId}/messages/${userMsgId}`;
-      await setDoc(doc(db, userMsgPath), {
+    setPendingMessages((prev) => [
+      ...prev,
+      {
+        id: userMsgId,
         userId: user.uid,
         conversationId: convId,
         role: 'user',
-        content: text.slice(0, 20000),
+        content: userMsgContent,
         hasAttachment: Boolean(currentAttachment),
-        createdAt: serverTimestamp(),
+        createdAtMs: Date.now(),
+      },
+    ]);
+
+    // Queue Firestore writes sequentially in the background so parent doc always precedes child messages
+    const userPersistPromise = firestoreQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const convPath = `users/${user.uid}/conversations/${convId}`;
+        if (isNewConversation) {
+          await setDoc(doc(db, convPath), {
+            userId: user.uid,
+            title: text.slice(0, 60),
+            lastMessagePreview: text.slice(0, 120),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          if (activeConversationIdRef.current === convId) {
+            setActiveConversationId(convId);
+          }
+        } else {
+          await updateDoc(doc(db, convPath), {
+            lastMessagePreview: text.slice(0, 120),
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        const userMsgPath = `users/${user.uid}/conversations/${convId}/messages/${userMsgId}`;
+        await setDoc(doc(db, userMsgPath), {
+          userId: user.uid,
+          conversationId: convId,
+          role: 'user',
+          content: userMsgContent,
+          hasAttachment: Boolean(currentAttachment),
+          createdAt: serverTimestamp(),
+        });
       });
-    })();
+
+    firestoreQueueRef.current = userPersistPromise;
+
+    const persistAssistantInBackground = (replyText: string) => {
+      const assistantMsgId = crypto.randomUUID();
+      const assistantContent = replyText.slice(0, 20000);
+
+      setPendingMessages((prev) => [
+        ...prev,
+        {
+          id: assistantMsgId,
+          userId: user.uid,
+          conversationId: convId,
+          role: 'assistant',
+          content: assistantContent,
+          hasAttachment: false,
+          createdAtMs: Date.now(),
+        },
+      ]);
+
+      const assistantPersistPromise = userPersistPromise
+        .then(async () => {
+          const assistantMsgPath = `users/${user.uid}/conversations/${convId}/messages/${assistantMsgId}`;
+          await setDoc(doc(db, assistantMsgPath), {
+            userId: user.uid,
+            conversationId: convId,
+            role: 'assistant',
+            content: assistantContent,
+            hasAttachment: false,
+            createdAt: serverTimestamp(),
+          });
+
+          await updateDoc(doc(db, `users/${user.uid}/conversations/${convId}`), {
+            lastMessagePreview: replyText.slice(0, 120),
+            updatedAt: serverTimestamp(),
+          });
+        })
+        .catch((persistErr) => {
+          console.error('Failed to persist assistant reply:', persistErr);
+          setError((prev) => prev || 'تم عرض الرد، لكن تعذر حفظه في سجل المحادثات.');
+        });
+
+      firestoreQueueRef.current = assistantPersistPromise;
+    };
 
     const controller = new AbortController();
     let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
@@ -314,23 +527,31 @@ export function ChatWorkspace({
         },
       ];
 
-      const idToken = await user.getIdToken();
+      let idToken = await user.getIdToken();
       resetInactivityTimer();
 
-      const response = await fetch('/api/nova/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-        },
-        body: JSON.stringify({
-          messages: historyPayload,
-          customInstruction,
-          thinkingDepth,
-          stream: true,
-        }),
-        signal: controller.signal,
-      });
+      const performChatFetch = (token: string) =>
+        fetch('/api/nova/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            ...getOtpHeaders(),
+          },
+          body: JSON.stringify({
+            messages: historyPayload,
+            customInstruction,
+            thinkingDepth,
+            stream: true,
+          }),
+          signal: controller.signal,
+        });
+
+      let response = await performChatFetch(idToken);
+      if (response.status === 401) {
+        idToken = await user.getIdToken(true);
+        response = await performChatFetch(idToken);
+      }
 
       const contentType = response.headers.get('content-type') || '';
 
@@ -352,20 +573,7 @@ export function ChatWorkspace({
           throw new Error(data.error || 'لم يرجع النموذج نصًا في الرد. يرجى المحاولة مجددًا.');
         }
 
-        await firestoreWritePromise;
-        const assistantMsgId = crypto.randomUUID();
-        await setDoc(doc(db, `users/${user.uid}/conversations/${convId}/messages/${assistantMsgId}`), {
-          userId: user.uid,
-          conversationId: convId,
-          role: 'assistant',
-          content: fallbackReply.slice(0, 20000),
-          hasAttachment: false,
-          createdAt: serverTimestamp(),
-        });
-        await updateDoc(doc(db, `users/${user.uid}/conversations/${convId}`), {
-          lastMessagePreview: fallbackReply.slice(0, 120),
-          updatedAt: serverTimestamp(),
-        });
+        persistAssistantInBackground(fallbackReply);
         return;
       }
 
@@ -431,24 +639,9 @@ export function ChatWorkspace({
         throw new Error('لم يرجع النموذج نصًا في الرد. يرجى المحاولة مجددًا.');
       }
 
-      await firestoreWritePromise;
-      const assistantMsgId = crypto.randomUUID();
-      const assistantMsgPath = `users/${user.uid}/conversations/${convId}/messages/${assistantMsgId}`;
-      await setDoc(doc(db, assistantMsgPath), {
-        userId: user.uid,
-        conversationId: convId,
-        role: 'assistant',
-        content: replyText.slice(0, 20000),
-        hasAttachment: false,
-        createdAt: serverTimestamp(),
-      });
-
-      await updateDoc(doc(db, `users/${user.uid}/conversations/${convId}`), {
-        lastMessagePreview: replyText.slice(0, 120),
-        updatedAt: serverTimestamp(),
-      });
+      persistAssistantInBackground(replyText);
     } catch (err) {
-      await firestoreWritePromise.catch(() => undefined);
+      await userPersistPromise.catch(() => undefined);
       const errMsg = err instanceof Error ? err.message : '';
       if (
         (err instanceof DOMException && err.name === 'AbortError') ||
@@ -463,7 +656,6 @@ export function ChatWorkspace({
       if (inactivityTimer) clearTimeout(inactivityTimer);
       clearTimeout(maxTotalTimer);
       setStreamingReply('');
-      setPendingUserMessage(null);
       setIsLoadingReply(false);
     }
   };
@@ -475,10 +667,15 @@ export function ChatWorkspace({
 
   const firstName = user.displayName?.split(' ')[0] || 'بك';
 
-  const displayedMessages =
-    pendingUserMessage && !messages.some((m) => m.id === pendingUserMessage.id)
-      ? [...messages, pendingUserMessage]
-      : messages;
+  const currentTargetConvId = activeConversationIdRef.current;
+  const displayedMessages = [
+    ...messages,
+    ...pendingMessages.filter(
+      (pm) =>
+        (!currentTargetConvId || pm.conversationId === currentTargetConvId) &&
+        !messages.some((m) => m.id === pm.id)
+    ),
+  ];
 
   const statusLabel =
     streamPhase === 'retrying'
@@ -494,10 +691,7 @@ export function ChatWorkspace({
         <div className="p-4 border-b border-slate-200 dark:border-white/10">
           <button
             type="button"
-            onClick={() => {
-              setActiveConversationId(null);
-              setError(null);
-            }}
+            onClick={() => selectConversation(null)}
             className="accent-btn w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-white text-sm font-semibold transition-all cursor-pointer whitespace-nowrap"
           >
             <Plus className="w-4 h-4" />
@@ -524,10 +718,7 @@ export function ChatWorkspace({
                 >
                   <button
                     type="button"
-                    onClick={() => {
-                      setActiveConversationId(conv.id);
-                      setError(null);
-                    }}
+                    onClick={() => selectConversation(conv.id)}
                     className="flex-1 min-w-0 text-right cursor-pointer"
                   >
                     <div className="text-sm font-medium truncate">{conv.title}</div>
@@ -567,7 +758,7 @@ export function ChatWorkspace({
             <button
               type="button"
               onClick={() => {
-                setActiveConversationId(null);
+                selectConversation(null);
                 setMobileSidebarOpen(false);
               }}
               className="accent-btn mt-4 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-white text-sm font-semibold"
@@ -588,7 +779,7 @@ export function ChatWorkspace({
                   <button
                     type="button"
                     onClick={() => {
-                      setActiveConversationId(conv.id);
+                      selectConversation(conv.id);
                       setMobileSidebarOpen(false);
                     }}
                     className="flex-1 min-w-0 text-right"
@@ -629,31 +820,54 @@ export function ChatWorkspace({
             </span>
           </div>
 
-          <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100 dark:bg-[#050814] border border-slate-200 dark:border-white/10 shrink-0 w-full sm:w-auto justify-center">
-            <button
-              type="button"
-              onClick={() => setThinkingDepth('low')}
-              className={`flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap border ${
-                thinkingDepth === 'low'
-                  ? 'accent-active-tab text-slate-900 dark:text-white'
-                  : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              <Zap className="w-3.5 h-3.5" />
-              <span>استجابة سريعة</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setThinkingDepth('high')}
-              className={`flex-1 sm:flex-initial inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap border ${
-                thinkingDepth === 'high'
-                  ? 'accent-active-tab text-slate-900 dark:text-white'
-                  : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              <Brain className="w-3.5 h-3.5" />
-              <span>تحليل عميق</span>
-            </button>
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setVoiceModalOpen(true)}
+                className="accent-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
+              >
+                <Mic className="w-3.5 h-3.5" />
+                <span>محادثة صوتية</span>
+              </button>
+              {onOpenPresentation && (
+                <button
+                  type="button"
+                  onClick={() => onOpenPresentation()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-[#050814] border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/25 text-xs font-semibold text-slate-800 dark:text-slate-100 cursor-pointer whitespace-nowrap"
+                >
+                  <Presentation className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
+                  <span>عرض PowerPoint</span>
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100 dark:bg-[#050814] border border-slate-200 dark:border-white/10 shrink-0">
+              <button
+                type="button"
+                onClick={() => setThinkingDepth('low')}
+                className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap border ${
+                  thinkingDepth === 'low'
+                    ? 'accent-active-tab text-slate-900 dark:text-white'
+                    : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span>استجابة سريعة</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setThinkingDepth('high')}
+                className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap border ${
+                  thinkingDepth === 'high'
+                    ? 'accent-active-tab text-slate-900 dark:text-white'
+                    : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Brain className="w-3.5 h-3.5" />
+                <span>تحليل عميق</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -698,6 +912,13 @@ export function ChatWorkspace({
                     <div className="mt-1 shrink-0">
                       <NovaStarLogo size="sm" />
                     </div>
+                  ) : userAvatarUrl ? (
+                    <img
+                      src={userAvatarUrl}
+                      alt={firstName}
+                      referrerPolicy="no-referrer"
+                      className="w-8 h-8 sm:w-9 sm:h-9 rounded-full object-cover shrink-0 mt-1 border border-slate-300 dark:border-white/20"
+                    />
                   ) : (
                     <div className="accent-btn w-8 h-8 sm:w-9 sm:h-9 rounded-full text-white flex items-center justify-center text-xs font-bold shrink-0 mt-1">
                       {firstName.slice(0, 1)}
@@ -711,22 +932,60 @@ export function ChatWorkspace({
                         : 'bg-white dark:bg-[#070B18]/90 border-slate-200 dark:border-white/10 text-slate-900 dark:text-slate-100'
                     }`}
                   >
-                    <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 mb-2">
-                      <span className="font-semibold text-slate-700 dark:text-slate-300">
-                        {msg.role === 'user' ? 'أنت' : 'Nova AI'}
-                      </span>
-                      {msg.hasAttachment && (
-                        <>
-                          <span aria-hidden="true">·</span>
-                          <span style={{ color: 'var(--accent-text)' }}>مرفق صورة</span>
-                        </>
+                    <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400 mb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-slate-700 dark:text-slate-300">
+                          {msg.role === 'user' ? 'أنت' : 'Nova AI'}
+                        </span>
+                        {msg.hasAttachment && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span style={{ color: 'var(--accent-text)' }}>مرفق صورة</span>
+                          </>
+                        )}
+                      </div>
+
+                      {msg.role === 'assistant' && (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleTts(msg.id, msg.content)}
+                            disabled={loadingTtsId === msg.id}
+                            aria-label={speakingMsgId === msg.id ? 'إيقاف الصوت' : 'استماع للرد'}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-white/10 text-[11px] font-medium cursor-pointer transition-colors"
+                          >
+                            {speakingMsgId === msg.id ? (
+                              <>
+                                <Square className="w-3 h-3 text-rose-500" />
+                                <span>إيقاف</span>
+                              </>
+                            ) : (
+                              <>
+                                <Volume2 className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
+                                <span>{loadingTtsId === msg.id ? 'جاري التحميل...' : 'استماع'}</span>
+                              </>
+                            )}
+                          </button>
+                          {onOpenPresentation && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenPresentation(msg.content.slice(0, 120))}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-white/10 text-[11px] font-medium cursor-pointer transition-colors"
+                            >
+                              <Presentation className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
+                              <span className="hidden sm:inline">PowerPoint</span>
+                            </button>
+                          )}
+                        </div>
                       )}
                     </div>
-                    {msg.role === 'assistant' ? (
-                      <MarkdownMessage content={msg.content} />
-                    ) : (
-                      <p className="text-sm sm:text-[15px] leading-[1.75] whitespace-pre-wrap break-words">{msg.content}</p>
-                    )}
+                    <div className="nova-themed-text">
+                      {msg.role === 'assistant' ? (
+                        <MarkdownMessage content={msg.content} />
+                      ) : (
+                        <p className="text-sm sm:text-[15px] leading-[1.75] whitespace-pre-wrap break-words">{msg.content}</p>
+                      )}
+                    </div>
                   </div>
                 </div>
               ))}
@@ -811,7 +1070,7 @@ export function ChatWorkspace({
             </div>
           )}
 
-          <div className="flex items-end gap-2 sm:gap-3">
+          <div className="flex items-end gap-1.5 sm:gap-2.5">
             <input
               ref={fileInputRef}
               type="file"
@@ -821,13 +1080,33 @@ export function ChatWorkspace({
             />
             <button
               type="button"
+              onClick={() => setCameraModalOpen(true)}
+              disabled={isLoadingReply}
+              aria-label="التصوير بالكاميرا"
+              title="التصوير بالكاميرا والتحليل"
+              className="min-w-[44px] min-h-[44px] p-3 rounded-xl bg-white dark:bg-[#0E152B] border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/25 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors shrink-0 cursor-pointer flex items-center justify-center"
+            >
+              <Camera className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+            </button>
+            <button
+              type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={isLoadingReply}
               aria-label="إرفاق صورة"
-              title="إرفاق صورة"
+              title="إرفاق صورة من الجهاز"
               className="min-w-[44px] min-h-[44px] p-3 rounded-xl bg-white dark:bg-[#0E152B] border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/25 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors shrink-0 cursor-pointer flex items-center justify-center"
             >
               <Paperclip className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setVoiceModalOpen(true)}
+              disabled={isLoadingReply}
+              aria-label="التحدث صوتيًا"
+              title="محادثة صوتية مباشرة"
+              className="min-w-[44px] min-h-[44px] p-3 rounded-xl bg-white dark:bg-[#0E152B] border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/25 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors shrink-0 cursor-pointer flex items-center justify-center"
+            >
+              <Mic className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
             </button>
 
             <textarea
@@ -841,13 +1120,13 @@ export function ChatWorkspace({
                   sendMessage();
                 }
               }}
-              placeholder="اكتب طلبك أو سؤالك هنا باللغة العربية..."
+              placeholder="اكتب طلبك أو التقط صورة أو تحدّث صوتيًا..."
               className="accent-focus flex-1 min-w-0 min-h-[44px] max-h-36 rounded-xl bg-white dark:bg-[#0E152B] border border-slate-200 dark:border-white/15 focus:outline-none px-3.5 sm:px-4 py-2.5 sm:py-3 text-sm text-slate-900 dark:text-white placeholder:text-slate-400 dark:placeholder:text-slate-500 resize-none"
             />
 
             <button
               type="submit"
-              disabled={isLoadingReply || !input.trim()}
+              disabled={isLoadingReply || (!input.trim() && !attachment)}
               className="accent-btn inline-flex items-center justify-center gap-1.5 sm:gap-2 min-h-[44px] px-3.5 sm:px-5 py-2.5 sm:py-3 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs sm:text-sm font-semibold transition-all shrink-0 cursor-pointer"
             >
               <span>إرسال</span>
@@ -856,6 +1135,29 @@ export function ChatWorkspace({
           </div>
         </form>
       </section>
+
+      {cameraModalOpen && (
+        <CameraCaptureModal
+          onClose={() => setCameraModalOpen(false)}
+          onAttach={(img) => {
+            setAttachment(img);
+            setError(null);
+            setTimeout(() => textareaRef.current?.focus(), 60);
+          }}
+          onAnalyzeNow={(img) => {
+            sendMessage('حلّل هذه الصورة بالتفصيل واشرح ما يظهر فيها بدقة.', img);
+          }}
+        />
+      )}
+
+      {voiceModalOpen && (
+        <LiveVoiceModal
+          user={user}
+          customInstruction={customInstruction}
+          onClose={() => setVoiceModalOpen(false)}
+          onAppendTurns={handleAppendVoiceTurns}
+        />
+      )}
     </div>
   );
 }
