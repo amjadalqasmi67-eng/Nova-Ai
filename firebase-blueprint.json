@@ -117,12 +117,87 @@
         "hasAttachment": {
           "type": "boolean"
         },
+        "rating": {
+          "type": "string",
+          "enum": ["none", "like", "dislike"]
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
         }
       },
       "required": ["userId", "conversationId", "role", "content", "hasAttachment", "createdAt"]
+    },
+    "StudyHistoryItem": {
+      "title": "StudyHistoryItem",
+      "description": "Personal study activity history entry (lesson summary, flashcards, homework guidance, or generated exam).",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["summary", "flashcards", "homework", "exam"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "subject": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "inputPreview": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 15000
+        },
+        "itemCount": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["userId", "type", "title", "content", "createdAt"]
+    },
+    "SharedSnippet": {
+      "title": "SharedSnippet",
+      "description": "Publicly accessible capability-link snapshot of a single selected question and assistant answer without exposing user profile or other conversations.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "question", "answer", "createdAt"]
     },
     "ContactMessage": {
       "title": "ContactMessage",
@@ -222,7 +297,15 @@
     },
     "/users/{userId}/conversations/{conversationId}/messages/{messageId}": {
       "schema": { "$ref": "#/entities/Message" },
-      "description": "Owner-only chat messages under a conversation."
+      "description": "Owner-only chat messages under a conversation with optional like/dislike rating."
+    },
+    "/users/{userId}/studyHistory/{recordId}": {
+      "schema": { "$ref": "#/entities/StudyHistoryItem" },
+      "description": "Owner-only history of recent lesson summaries, flashcards, homework guidance, and generated exams."
+    },
+    "/sharedSnippets/{shareId}": {
+      "schema": { "$ref": "#/entities/SharedSnippet" },
+      "description": "Unguessable capability-link Q&A snapshots readable by link holders without exposing owner account data; non-listable."
     },
     "/contactMessages/{messageId}": {
       "schema": { "$ref": "#/entities/ContactMessage" },

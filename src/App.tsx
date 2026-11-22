@@ -25,6 +25,9 @@ import {
   HelpCircle,
   Mail,
   ClipboardCheck,
+  ShieldCheck,
+  GraduationCap,
+  History,
 } from 'lucide-react';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from './firebase';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -35,10 +38,14 @@ import { OtpGate } from './components/OtpGate';
 import { ChatWorkspace } from './components/ChatWorkspace';
 import { PresentationStudio } from './components/PresentationStudio';
 import { ExamStudio } from './components/ExamStudio';
+import { StudyStudio } from './components/StudyStudio';
+import { UsageHistoryPage } from './components/UsageHistoryPage';
+import { SharedSnippetPage } from './components/SharedSnippetPage';
 import { AboutPage } from './components/AboutPage';
 import { HelpPage } from './components/HelpPage';
 import { FaqPage } from './components/FaqPage';
 import { ContactPage } from './components/ContactPage';
+import { PrivacyPolicyPage } from './components/PrivacyPolicyPage';
 import { OwnerDashboardPage, isOwnerAdmin } from './components/OwnerDashboardPage';
 import { SettingsPage } from './components/SettingsPage';
 import { PWAInstallButton } from './components/PWAInstallButton';
@@ -68,17 +75,43 @@ import {
   verifyStoredPin,
 } from './lib/pinSecurity';
 import { getOtpHeaders, setOtpSessionToken } from './lib/otpSession';
+import { sanitizeUserText } from './lib/sanitize';
 
-type PrimaryTab = 'chat' | 'pptx' | 'exam' | 'about' | 'help' | 'faq' | 'contact' | 'owner';
+type PrimaryTab =
+  | 'chat'
+  | 'study'
+  | 'pptx'
+  | 'exam'
+  | 'history'
+  | 'about'
+  | 'help'
+  | 'faq'
+  | 'contact'
+  | 'privacy'
+  | 'owner';
 type StudioTab = PrimaryTab | 'settings';
 
 const PUBLIC_NAV_TABS: Array<{ id: PrimaryTab; label: string; icon: typeof MessageSquare }> = [
   { id: 'chat', label: 'المحادثة الذكية', icon: MessageSquare },
-  { id: 'pptx', label: 'عروض PowerPoint', icon: Presentation },
-  { id: 'exam', label: 'صانع الاختبارات', icon: ClipboardCheck },
+  { id: 'study', label: 'أدوات المذاكرة', icon: GraduationCap },
+  { id: 'pptx', label: 'العروض', icon: Presentation },
+  { id: 'exam', label: 'الاختبارات', icon: ClipboardCheck },
+  { id: 'history', label: 'سجلي', icon: History },
   { id: 'about', label: 'من نحن', icon: Info },
   { id: 'contact', label: 'تواصل معنا', icon: Mail },
 ];
+
+function isInitialPrivacyUrl(): boolean {
+  if (typeof window === 'undefined') return false;
+  const pageParam = new URLSearchParams(window.location.search).get('page');
+  return pageParam === 'privacy' || window.location.pathname === '/privacy';
+}
+
+function getInitialShareId(): string | null {
+  if (typeof window === 'undefined') return null;
+  const shareParam = new URLSearchParams(window.location.search).get('share');
+  return shareParam && shareParam.trim().length > 0 ? shareParam.trim() : null;
+}
 
 function NovaApplication() {
   const [user, setUser] = useState<User | null>(null);
@@ -89,11 +122,14 @@ function NovaApplication() {
   const [otpEmailMasked, setOtpEmailMasked] = useState('');
   const [otpCooldownSec, setOtpCooldownSec] = useState(0);
 
-  const [activeTab, setActiveTab] = useState<StudioTab>('chat');
+  const [activeShareId, setActiveShareId] = useState<string | null>(() => getInitialShareId());
+  const [showGuestPrivacy, setShowGuestPrivacy] = useState<boolean>(() => isInitialPrivacyUrl());
+  const [activeTab, setActiveTab] = useState<StudioTab>(() => (isInitialPrivacyUrl() ? 'privacy' : 'chat'));
   const [previousTab, setPreviousTab] = useState<PrimaryTab>('chat');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [draftPrompt, setDraftPrompt] = useState<string | null>(null);
   const [pptxTopicDraft, setPptxTopicDraft] = useState<string | null>(null);
+  const [customDisplayName, setCustomDisplayName] = useState('');
   const [customInstruction, setCustomInstruction] = useState('');
   const [customAvatarUrl, setCustomAvatarUrl] = useState<string>('');
   const [urgentUnreadCount, setUrgentUnreadCount] = useState(0);
@@ -125,9 +161,10 @@ function NovaApplication() {
         try {
           const snap = await getDoc(doc(db, userPath));
           if (!snap.exists()) {
+            const initialDisplayName = (firebaseUser.displayName || 'Nova User').slice(0, 120);
             await setDoc(doc(db, userPath), {
               uid: firebaseUser.uid,
-              displayName: (firebaseUser.displayName || 'Nova User').slice(0, 120),
+              displayName: initialDisplayName,
               email: (firebaseUser.email || 'user@nova.ai').slice(0, 200),
               customInstruction: '',
               accentColor,
@@ -138,10 +175,16 @@ function NovaApplication() {
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
             });
+            setCustomDisplayName(initialDisplayName);
             setCustomInstruction('');
             setCustomAvatarUrl('');
           } else {
             const data = snap.data();
+            const storedName =
+              typeof data.displayName === 'string' && data.displayName.trim()
+                ? data.displayName.trim().slice(0, 120)
+                : (firebaseUser.displayName || 'Nova User').slice(0, 120);
+            setCustomDisplayName(storedName);
             setCustomInstruction(String(data.customInstruction || ''));
             setCustomAvatarUrl(String(data.avatarDataUrl || ''));
             if (isValidAccentColor(data.accentColor)) {
@@ -187,13 +230,22 @@ function NovaApplication() {
         }
 
         try {
-          const idToken = await firebaseUser.getIdToken();
-          const otpRes = await fetch('/api/auth/otp/status', {
+          let idToken = await firebaseUser.getIdToken();
+          let otpRes = await fetch('/api/auth/otp/status', {
             headers: {
               Authorization: `Bearer ${idToken}`,
               ...getOtpHeaders(),
             },
           });
+          if (otpRes.status === 401) {
+            idToken = await firebaseUser.getIdToken(true);
+            otpRes = await fetch('/api/auth/otp/status', {
+              headers: {
+                Authorization: `Bearer ${idToken}`,
+                ...getOtpHeaders(),
+              },
+            });
+          }
           if (otpRes.ok) {
             const otpData = (await otpRes.json()) as {
               otpRequired?: boolean;
@@ -210,16 +262,28 @@ function NovaApplication() {
             );
             setOtpStatus(otpData.otpRequired ? 'required' : 'verified');
           } else {
-            setOtpStatus('verified');
+            // Never fail open if the server indicates OTP is configured
+            const healthRes = await fetch('/api/health').catch(() => null);
+            const healthData = healthRes?.ok
+              ? ((await healthRes.json().catch(() => ({}))) as { otpConfigured?: boolean })
+              : { otpConfigured: true };
+            setOtpEmailMasked(firebaseUser.email || '');
+            setOtpStatus(healthData.otpConfigured ? 'required' : 'verified');
           }
         } catch {
-          setOtpStatus('verified');
+          if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            setOtpStatus('verified');
+          } else {
+            setOtpEmailMasked(firebaseUser.email || '');
+            setOtpStatus('required');
+          }
         }
       } else {
         setOtpSessionToken(null);
         setOtpStatus('idle');
         setOtpEmailMasked('');
         setOtpCooldownSec(0);
+        setCustomDisplayName('');
       }
       setUser(firebaseUser);
       setAuthReady(true);
@@ -316,6 +380,7 @@ function NovaApplication() {
   };
 
   const persistUserField = async (patch: {
+    displayName?: string;
     customInstruction?: string;
     accentColor?: AccentColor;
     themeMode?: ThemeMode;
@@ -327,7 +392,6 @@ function NovaApplication() {
     const userPath = `users/${user.uid}`;
     try {
       await updateDoc(doc(db, userPath), {
-        displayName: (user.displayName || 'Nova User').slice(0, 120),
         email: (user.email || 'user@nova.ai').slice(0, 200),
         ...patch,
         updatedAt: serverTimestamp(),
@@ -366,9 +430,19 @@ function NovaApplication() {
     setCustomAvatarUrl(avatarDataUrl);
   };
 
+  const handleSaveDisplayName = async (nextName: string) => {
+    const clean = sanitizeUserText(nextName, 120, false);
+    if (!clean) {
+      throw new Error('يرجى كتابة اسم عرض صالح (حرف واحد على الأقل).');
+    }
+    await persistUserField({ displayName: clean });
+    setCustomDisplayName(clean);
+  };
+
   const handleSaveInstruction = async (instruction: string) => {
-    await persistUserField({ customInstruction: instruction.slice(0, 1000) });
-    setCustomInstruction(instruction);
+    const clean = sanitizeUserText(instruction, 1000);
+    await persistUserField({ customInstruction: clean });
+    setCustomInstruction(clean);
   };
 
   useEffect(() => {
@@ -463,6 +537,28 @@ function NovaApplication() {
   }, [mobileNavOpen]);
 
   const resolvedAvatarUrl = customAvatarUrl || user?.photoURL || null;
+  const resolvedDisplayName = (customDisplayName || user?.displayName || 'Nova User').trim();
+
+  const openGuestPrivacy = () => {
+    setShowGuestPrivacy(true);
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', '/?page=privacy');
+    }
+  };
+
+  const closeGuestPrivacy = () => {
+    setShowGuestPrivacy(false);
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', '/');
+    }
+  };
+
+  const closeSharedSnippet = () => {
+    setActiveShareId(null);
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', '/');
+    }
+  };
 
   return (
     <div
@@ -471,13 +567,44 @@ function NovaApplication() {
     >
       <StarfieldCanvas themeMode={themeMode} backgroundStyle={backgroundStyle} />
 
-      {!authReady ? (
+      {activeShareId ? (
+        <SharedSnippetPage shareId={activeShareId} onGoHome={closeSharedSnippet} />
+      ) : !authReady ? (
         <div className="relative z-10 min-h-[100dvh] flex flex-col items-center justify-center gap-4 px-4">
           <NovaStarLogo size="lg" />
           <div className="text-sm text-slate-600 dark:text-slate-300">جاري تجهيز بوابة Nova AI...</div>
         </div>
       ) : !user ? (
-        <LoginGate onSignIn={handleSignIn} isLoading={authLoading} error={authError} />
+        showGuestPrivacy ? (
+          <div className="relative z-10 min-h-[100dvh] flex flex-col justify-between">
+            <header className="border-b border-slate-200 dark:border-white/10 bg-white/80 dark:bg-[#070B17]/85 backdrop-blur-md">
+              <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={closeGuestPrivacy}
+                  className="flex items-center gap-2.5 cursor-pointer shrink-0"
+                >
+                  <NovaStarLogo size="sm" />
+                  <span dir="ltr" className="text-lg font-bold tracking-tight text-slate-900 dark:text-white">
+                    Nova AI
+                  </span>
+                </button>
+                <PWAInstallButton variant="header" />
+              </div>
+            </header>
+            <PrivacyPolicyPage onBack={closeGuestPrivacy} backLabel="العودة لصفحة الدخول" />
+            <footer className="border-t border-slate-200 dark:border-white/10 py-3 px-4 sm:px-6 text-center text-xs text-slate-500">
+              Nova AI · منصة الذكاء الاصطناعي العربية · 2026
+            </footer>
+          </div>
+        ) : (
+          <LoginGate
+            onSignIn={handleSignIn}
+            isLoading={authLoading}
+            error={authError}
+            onOpenPrivacy={openGuestPrivacy}
+          />
+        )
       ) : otpStatus === 'required' ? (
         <OtpGate
           user={user}
@@ -537,279 +664,284 @@ function NovaApplication() {
         </div>
       ) : (
         <div className="relative z-10 h-[100dvh] flex flex-col overflow-hidden">
-          {/* Clean 3-Zone Top Header */}
-          <header className="shrink-0 border-b border-slate-200 dark:border-white/10 bg-white/80 dark:bg-[#070B17]/85 backdrop-blur-md">
-            <div className="max-w-7xl mx-auto px-3 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-3 sm:gap-4">
-              {/* Zone 1: Mobile/Tablet Side Drawer Toggle + Glowing Star Logo + Nova AI wordmark */}
-              <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setMobileNavOpen(true)}
-                  aria-label="فتح قائمة التنقل الجانبية"
-                  aria-expanded={mobileNavOpen}
-                  className="lg:hidden min-w-[40px] min-h-[40px] p-2 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-700 dark:text-slate-200 transition-colors cursor-pointer flex items-center justify-center relative"
-                >
-                  <Menu className="w-5 h-5" />
-                  {isOwner && urgentUnreadCount > 0 && (
-                    <span className="absolute -top-1 -left-1 w-2.5 h-2.5 rounded-full bg-rose-600 ring-2 ring-white dark:ring-[#070B17]" />
-                  )}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigateTo('chat')}
-                  className="flex items-center gap-2 sm:gap-2.5 shrink-0 cursor-pointer"
-                >
-                  <NovaStarLogo size="sm" />
-                  <span
-                    dir="ltr"
-                    className="text-base sm:text-lg font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0"
-                  >
-                    Nova AI
-                  </span>
-                </button>
-              </div>
-
-              {/* Zone 2: Single-Row Desktop Navigation Links (1024px+) */}
-              <nav aria-label="أقسام التطبيق" className="hidden lg:flex items-center gap-1.5">
-                {PUBLIC_NAV_TABS.map((tab) => {
-                  const active = activeTab === tab.id;
-                  return (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      onClick={() => navigateTo(tab.id)}
-                      className={`px-3.5 py-2 rounded-xl text-sm font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer border ${
-                        active
-                          ? 'accent-active-tab text-slate-900 dark:text-white'
-                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border-transparent'
-                      }`}
-                    >
-                      {tab.label}
-                    </button>
-                  );
-                })}
-                {isOwner && (
+          {/* Clean 3-Zone Top Header + Mobile Top Dropdown Anchor */}
+          <div className="relative z-30 shrink-0">
+            <header className="border-b border-slate-200 dark:border-white/10 bg-white/85 dark:bg-[#070B17]/90 backdrop-blur-md">
+              <div className="max-w-7xl mx-auto px-2.5 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-2 sm:gap-4">
+                {/* Zone 1: Mobile Dropdown Menu Button + Glowing Star Logo + Nova AI wordmark */}
+                <div className="flex items-center gap-2 sm:gap-2.5 min-w-0 shrink-0">
                   <button
                     type="button"
-                    onClick={() => navigateTo('owner')}
-                    className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold transition-all whitespace-nowrap shrink-0 cursor-pointer border ${
-                      activeTab === 'owner'
-                        ? 'accent-active-tab text-slate-900 dark:text-white'
-                        : urgentUnreadCount > 0
-                          ? 'bg-rose-500/10 border-rose-500/35 text-rose-700 dark:text-rose-200 hover:bg-rose-500/20'
-                          : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white border-transparent'
-                    }`}
+                    onClick={() => setMobileNavOpen((v) => !v)}
+                    aria-label={mobileNavOpen ? 'إغلاق قائمة التنقل' : 'فتح قائمة التنقل'}
+                    aria-expanded={mobileNavOpen}
+                    className="lg:hidden min-w-[40px] min-h-[40px] p-2 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-700 dark:text-slate-200 transition-colors cursor-pointer flex items-center justify-center relative shrink-0"
                   >
-                    <ShieldAlert className="w-3.5 h-3.5" />
-                    <span>لوحة المالك</span>
-                    {urgentUnreadCount > 0 && (
-                      <span className="px-1.5 py-0.2 rounded-md bg-rose-600 text-white text-[10px] font-bold tabular-nums">
-                        {urgentUnreadCount}
-                      </span>
+                    {mobileNavOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+                    {isOwner && urgentUnreadCount > 0 && !mobileNavOpen && (
+                      <span className="absolute -top-1 -left-1 w-2.5 h-2.5 rounded-full bg-rose-600 ring-2 ring-white dark:ring-[#070B17]" />
                     )}
                   </button>
-                )}
-              </nav>
-
-              {/* Zone 3: Install App Button + Optional Quick Lock + Settings Gear Icon */}
-              <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-                <PWAInstallButton variant="header" />
-                {savedPinHash && (
                   <button
                     type="button"
-                    onClick={() => setIsScreenLocked(true)}
-                    aria-label="قفل الجلسة"
-                    title="قفل الجلسة"
-                    className="min-w-[40px] min-h-[40px] p-2 sm:p-2.5 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-700 dark:text-slate-300 transition-colors shrink-0 cursor-pointer flex items-center justify-center"
+                    onClick={() => navigateTo('chat')}
+                    className="flex items-center gap-2 sm:gap-2.5 min-w-0 shrink-0 cursor-pointer"
                   >
-                    <Lock className="w-4 h-4" />
+                    <NovaStarLogo size="sm" />
+                    <span
+                      dir="ltr"
+                      className="text-base sm:text-lg font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0"
+                    >
+                      Nova AI
+                    </span>
                   </button>
-                )}
-                <button
-                  type="button"
-                  onClick={openSettings}
-                  aria-label="الإعدادات"
-                  title="الإعدادات"
-                  className={`inline-flex items-center justify-center gap-2 min-w-[40px] min-h-[40px] px-2.5 sm:px-3 py-2 rounded-xl text-xs sm:text-sm font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer border ${
-                    activeTab === 'settings'
-                      ? 'accent-active-tab text-slate-900 dark:text-white'
-                      : 'bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border-transparent text-slate-700 dark:text-slate-200'
-                  }`}
-                >
-                  {resolvedAvatarUrl ? (
-                    <img
-                      src={resolvedAvatarUrl}
-                      alt={user.displayName || 'حسابي'}
-                      referrerPolicy="no-referrer"
-                      className="w-5 h-5 rounded-full object-cover shrink-0"
-                    />
-                  ) : (
-                    <Settings className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
-                  )}
-                  <span className="hidden sm:inline">الإعدادات</span>
-                </button>
-              </div>
-            </div>
-          </header>
+                </div>
 
-          {/* Sliding RTL Side Navigation Drawer for Mobile & iPad Portrait */}
-          <AnimatePresence>
-            {mobileNavOpen && (
-              <div className="fixed inset-0 z-50 lg:hidden flex">
-                <motion.aside
-                  initial={{ x: '100%' }}
-                  animate={{ x: 0 }}
-                  exit={{ x: '100%' }}
-                  transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-                  aria-label="قائمة التنقل الجانبية"
-                  className="relative z-10 w-72 max-w-[84vw] h-full bg-white/95 dark:bg-[#070B18]/95 border-l border-slate-200 dark:border-white/15 backdrop-blur-xl flex flex-col shadow-2xl"
-                >
-                  {/* Drawer Header */}
-                  <div className="flex items-center justify-between px-4 py-4 border-b border-slate-200 dark:border-white/10">
-                    <div className="flex items-center gap-2.5">
-                      <NovaStarLogo size="sm" />
-                      <span dir="ltr" className="text-base font-bold text-slate-900 dark:text-white">
-                        Nova AI
-                      </span>
-                    </div>
+                {/* Zone 2: Single-Row Desktop Navigation Links (1024px+) */}
+                <nav aria-label="أقسام التطبيق" className="hidden lg:flex items-center gap-1 xl:gap-1.5">
+                  {PUBLIC_NAV_TABS.map((tab) => {
+                    const active = activeTab === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => navigateTo(tab.id)}
+                        className={`px-2.5 xl:px-3 py-2 rounded-xl text-xs xl:text-sm font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer border ${
+                          active
+                            ? 'accent-active-tab text-slate-900 dark:text-white'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border-transparent'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    );
+                  })}
+                  {isOwner && (
                     <button
                       type="button"
-                      onClick={() => setMobileNavOpen(false)}
-                      aria-label="إغلاق القائمة"
-                      className="min-w-[40px] min-h-[40px] p-2 rounded-xl text-slate-500 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5 flex items-center justify-center cursor-pointer"
+                      onClick={() => navigateTo('owner')}
+                      className={`inline-flex items-center gap-1.5 px-2.5 xl:px-3 py-2 rounded-xl text-xs xl:text-sm font-semibold transition-all whitespace-nowrap shrink-0 cursor-pointer border ${
+                        activeTab === 'owner'
+                          ? 'accent-active-tab text-slate-900 dark:text-white'
+                          : urgentUnreadCount > 0
+                            ? 'bg-rose-500/10 border-rose-500/35 text-rose-700 dark:text-rose-200 hover:bg-rose-500/20'
+                            : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white border-transparent'
+                      }`}
                     >
-                      <X className="w-5 h-5" />
+                      <ShieldAlert className="w-3.5 h-3.5" />
+                      <span>لوحة المالك</span>
+                      {urgentUnreadCount > 0 && (
+                        <span className="px-1.5 py-0.2 rounded-md bg-rose-600 text-white text-[10px] font-bold tabular-nums">
+                          {urgentUnreadCount}
+                        </span>
+                      )}
                     </button>
-                  </div>
+                  )}
+                </nav>
 
-                  {/* Drawer Navigation Links */}
-                  <nav className="flex-1 overflow-y-auto p-3 space-y-1.5">
-                    {PUBLIC_NAV_TABS.map((tab) => {
-                      const Icon = tab.icon;
-                      const active = activeTab === tab.id;
-                      return (
+                {/* Zone 3: Install App Button + Optional Quick Lock + Settings Gear Icon */}
+                <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                  <PWAInstallButton variant="header" />
+                  {savedPinHash && (
+                    <button
+                      type="button"
+                      onClick={() => setIsScreenLocked(true)}
+                      aria-label="قفل الجلسة"
+                      title="قفل الجلسة"
+                      className="min-w-[38px] min-h-[38px] sm:min-w-[40px] sm:min-h-[40px] p-2 sm:p-2.5 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-700 dark:text-slate-300 transition-colors shrink-0 cursor-pointer flex items-center justify-center"
+                    >
+                      <Lock className="w-4 h-4" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={openSettings}
+                    aria-label="الإعدادات"
+                    title="الإعدادات"
+                    className={`inline-flex items-center justify-center gap-2 min-w-[38px] min-h-[38px] sm:min-w-[40px] sm:min-h-[40px] px-2.5 sm:px-3 py-2 rounded-xl text-xs sm:text-sm font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer border ${
+                      activeTab === 'settings'
+                        ? 'accent-active-tab text-slate-900 dark:text-white'
+                        : 'bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border-transparent text-slate-700 dark:text-slate-200'
+                    }`}
+                  >
+                    {resolvedAvatarUrl ? (
+                      <img
+                        src={resolvedAvatarUrl}
+                        alt={resolvedDisplayName}
+                        referrerPolicy="no-referrer"
+                        className="w-5 h-5 rounded-full object-cover shrink-0"
+                      />
+                    ) : (
+                      <Settings className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+                    )}
+                    <span className="hidden sm:inline">الإعدادات</span>
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            {/* Top Dropdown Navigation Menu for Mobile & Small Screens */}
+            <AnimatePresence>
+              {mobileNavOpen && (
+                <>
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.16 }}
+                    onClick={() => setMobileNavOpen(false)}
+                    className="fixed inset-x-0 bottom-0 top-14 sm:top-16 z-20 bg-black/50 backdrop-blur-xs lg:hidden"
+                  />
+                  <motion.nav
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                    aria-label="قائمة التنقل المنسدلة"
+                    className="absolute left-0 right-0 top-full z-30 lg:hidden bg-white/98 dark:bg-[#070B18]/98 border-b border-slate-200 dark:border-white/15 backdrop-blur-xl shadow-2xl max-h-[calc(100dvh-4rem)] overflow-y-auto"
+                  >
+                    <div className="max-w-7xl mx-auto p-3 sm:p-4 space-y-2">
+                      {/* User Strip */}
+                      <div className="flex items-center gap-3 px-3 py-2.5 rounded-xl bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10">
+                        {resolvedAvatarUrl ? (
+                          <img
+                            src={resolvedAvatarUrl}
+                            alt={resolvedDisplayName}
+                            referrerPolicy="no-referrer"
+                            className="w-8 h-8 rounded-full object-cover shrink-0 border border-white/15"
+                          />
+                        ) : (
+                          <div className="accent-btn w-8 h-8 rounded-full text-white flex items-center justify-center text-xs font-bold shrink-0">
+                            {resolvedDisplayName.slice(0, 1)}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                            {resolvedDisplayName}
+                          </div>
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate" dir="ltr">
+                            {user.email}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                        {PUBLIC_NAV_TABS.map((tab) => {
+                          const Icon = tab.icon;
+                          const active = activeTab === tab.id;
+                          return (
+                            <button
+                              key={tab.id}
+                              type="button"
+                              onClick={() => navigateTo(tab.id)}
+                              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                                active
+                                  ? 'accent-active-tab text-slate-900 dark:text-white'
+                                  : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
+                              }`}
+                            >
+                              <Icon
+                                className="w-4 h-4 shrink-0"
+                                style={active ? { color: 'var(--accent-primary)' } : undefined}
+                              />
+                              <span className="truncate">{tab.label}</span>
+                            </button>
+                          );
+                        })}
+
                         <button
-                          key={tab.id}
                           type="button"
-                          onClick={() => navigateTo(tab.id)}
-                          className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
-                            active
+                          onClick={() => navigateTo('help')}
+                          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                            activeTab === 'help'
                               ? 'accent-active-tab text-slate-900 dark:text-white'
                               : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
                           }`}
                         >
-                          <Icon
+                          <BookOpen
                             className="w-4 h-4 shrink-0"
-                            style={active ? { color: 'var(--accent-primary)' } : undefined}
+                            style={activeTab === 'help' ? { color: 'var(--accent-primary)' } : undefined}
                           />
-                          <span>{tab.label}</span>
+                          <span className="truncate">دليل المساعدة</span>
                         </button>
-                      );
-                    })}
 
-                    <button
-                      type="button"
-                      onClick={() => navigateTo('help')}
-                      className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
-                        activeTab === 'help'
-                          ? 'accent-active-tab text-slate-900 dark:text-white'
-                          : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
-                      }`}
-                    >
-                      <BookOpen
-                        className="w-4 h-4 shrink-0"
-                        style={activeTab === 'help' ? { color: 'var(--accent-primary)' } : undefined}
-                      />
-                      <span>دليل المساعدة</span>
-                    </button>
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('faq')}
+                          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                            activeTab === 'faq'
+                              ? 'accent-active-tab text-slate-900 dark:text-white'
+                              : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
+                          }`}
+                        >
+                          <HelpCircle
+                            className="w-4 h-4 shrink-0"
+                            style={activeTab === 'faq' ? { color: 'var(--accent-primary)' } : undefined}
+                          />
+                          <span className="truncate">أسئلة شائعة</span>
+                        </button>
 
-                    <button
-                      type="button"
-                      onClick={() => navigateTo('faq')}
-                      className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
-                        activeTab === 'faq'
-                          ? 'accent-active-tab text-slate-900 dark:text-white'
-                          : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
-                      }`}
-                    >
-                      <HelpCircle
-                        className="w-4 h-4 shrink-0"
-                        style={activeTab === 'faq' ? { color: 'var(--accent-primary)' } : undefined}
-                      />
-                      <span>أسئلة شائعة</span>
-                    </button>
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('privacy')}
+                          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                            activeTab === 'privacy'
+                              ? 'accent-active-tab text-slate-900 dark:text-white'
+                              : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
+                          }`}
+                        >
+                          <ShieldCheck
+                            className="w-4 h-4 shrink-0"
+                            style={activeTab === 'privacy' ? { color: 'var(--accent-primary)' } : undefined}
+                          />
+                          <span className="truncate">سياسة الخصوصية</span>
+                        </button>
 
-                    {isOwner && (
-                      <button
-                        type="button"
-                        onClick={() => navigateTo('owner')}
-                        className={`w-full flex items-center justify-between gap-2 px-3.5 py-3 rounded-xl text-sm font-semibold text-right transition-all cursor-pointer border min-h-[44px] mt-2 ${
-                          activeTab === 'owner'
-                            ? 'accent-active-tab text-slate-900 dark:text-white'
-                            : 'bg-rose-500/10 border-rose-500/35 text-rose-700 dark:text-rose-200'
-                        }`}
-                      >
-                        <span className="inline-flex items-center gap-3">
-                          <ShieldAlert className="w-4 h-4 shrink-0" />
-                          <span>لوحة المالك الخاصة</span>
-                        </span>
-                        {urgentUnreadCount > 0 && (
-                          <span className="px-2 py-0.5 rounded-md bg-rose-600 text-white text-[11px] font-bold tabular-nums">
-                            {urgentUnreadCount} عاجلة
+                        <button
+                          type="button"
+                          onClick={openSettings}
+                          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
+                            activeTab === 'settings'
+                              ? 'accent-active-tab text-slate-900 dark:text-white'
+                              : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
+                          }`}
+                        >
+                          <Settings className="w-4 h-4 shrink-0" style={{ color: 'var(--accent-primary)' }} />
+                          <span className="truncate">الإعدادات والمظهر</span>
+                        </button>
+                      </div>
+
+                      {isOwner && (
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('owner')}
+                          className={`w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl text-sm font-semibold text-right transition-all cursor-pointer border min-h-[44px] ${
+                            activeTab === 'owner'
+                              ? 'accent-active-tab text-slate-900 dark:text-white'
+                              : 'bg-rose-500/10 border-rose-500/35 text-rose-700 dark:text-rose-200'
+                          }`}
+                        >
+                          <span className="inline-flex items-center gap-3">
+                            <ShieldAlert className="w-4 h-4 shrink-0" />
+                            <span>لوحة المالك الخاصة</span>
                           </span>
-                        )}
-                      </button>
-                    )}
+                          {urgentUnreadCount > 0 && (
+                            <span className="px-2 py-0.5 rounded-md bg-rose-600 text-white text-[11px] font-bold tabular-nums">
+                              {urgentUnreadCount} عاجلة
+                            </span>
+                          )}
+                        </button>
+                      )}
 
-                    <div className="pt-2 mt-2 border-t border-slate-200 dark:border-white/10 space-y-1.5">
-                      <button
-                        type="button"
-                        onClick={openSettings}
-                        className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium text-right transition-all cursor-pointer border min-h-[44px] ${
-                          activeTab === 'settings'
-                            ? 'accent-active-tab text-slate-900 dark:text-white'
-                            : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 border-transparent'
-                        }`}
-                      >
-                        <Settings className="w-4 h-4 shrink-0" style={{ color: 'var(--accent-primary)' }} />
-                        <span>الإعدادات والمظهر</span>
-                      </button>
-                      <PWAInstallButton variant="drawer" />
-                    </div>
-                  </nav>
-
-                  {/* Drawer Footer User Info */}
-                  <div className="p-4 border-t border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-[#050814]/80 flex items-center gap-3">
-                    {resolvedAvatarUrl && (
-                      <img
-                        src={resolvedAvatarUrl}
-                        alt={user.displayName || 'Nova User'}
-                        referrerPolicy="no-referrer"
-                        className="w-9 h-9 rounded-full object-cover shrink-0 border border-white/15"
-                      />
-                    )}
-                    <div className="min-w-0">
-                      <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
-                        {user.displayName || 'Nova User'}
-                      </div>
-                      <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate mt-0.5" dir="ltr">
-                        {user.email}
+                      <div className="pt-1">
+                        <PWAInstallButton variant="drawer" />
                       </div>
                     </div>
-                  </div>
-                </motion.aside>
-
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.18 }}
-                  onClick={() => setMobileNavOpen(false)}
-                  className="flex-1 bg-black/60 backdrop-blur-xs"
-                />
-              </div>
-            )}
-          </AnimatePresence>
+                  </motion.nav>
+                </>
+              )}
+            </AnimatePresence>
+          </div>
 
           {/* Main Workspace Content */}
           <main className="flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -825,6 +957,7 @@ function NovaApplication() {
                 {activeTab === 'chat' && (
                   <ChatWorkspace
                     user={user}
+                    displayName={resolvedDisplayName}
                     userAvatarUrl={resolvedAvatarUrl}
                     customInstruction={customInstruction}
                     draftPrompt={draftPrompt}
@@ -835,6 +968,7 @@ function NovaApplication() {
                     }}
                   />
                 )}
+                {activeTab === 'study' && <StudyStudio user={user} />}
                 {activeTab === 'pptx' && (
                   <PresentationStudio
                     user={user}
@@ -843,6 +977,13 @@ function NovaApplication() {
                   />
                 )}
                 {activeTab === 'exam' && <ExamStudio user={user} />}
+                {activeTab === 'history' && (
+                  <UsageHistoryPage
+                    user={user}
+                    onOpenStudyTool={() => navigateTo('study')}
+                    onOpenExamTool={() => navigateTo('exam')}
+                  />
+                )}
                 {activeTab === 'about' && (
                   <AboutPage
                     onGoToChat={() => navigateTo('chat')}
@@ -869,9 +1010,13 @@ function NovaApplication() {
                 {activeTab === 'contact' && (
                   <ContactPage
                     user={user}
+                    displayName={resolvedDisplayName}
                     onGoToChat={() => navigateTo('chat')}
                     onGoToOwnerDashboard={isOwner ? () => navigateTo('owner') : undefined}
                   />
+                )}
+                {activeTab === 'privacy' && (
+                  <PrivacyPolicyPage onBack={() => navigateTo('chat')} backLabel="العودة للمحادثة" />
                 )}
                 {activeTab === 'owner' && (
                   <OwnerDashboardPage user={user} onBackToChat={() => navigateTo('chat')} />
@@ -879,7 +1024,7 @@ function NovaApplication() {
                 {activeTab === 'settings' && (
                   <SettingsPage
                     userEmail={user.email || ''}
-                    displayName={user.displayName || 'Nova User'}
+                    displayName={resolvedDisplayName}
                     avatarUrl={resolvedAvatarUrl}
                     hasCustomAvatar={Boolean(customAvatarUrl)}
                     themeMode={themeMode}
@@ -893,6 +1038,7 @@ function NovaApplication() {
                     onChangeBackground={handleChangeBackground}
                     onChangeFontColor={handleChangeFontColor}
                     onUpdateAvatar={handleUpdateAvatar}
+                    onSaveDisplayName={handleSaveDisplayName}
                     onSaveInstruction={handleSaveInstruction}
                     onUpdatePin={handleUpdatePin}
                     onSwitchAccount={handleSwitchAccount}
@@ -903,6 +1049,36 @@ function NovaApplication() {
               </motion.div>
             </AnimatePresence>
           </main>
+
+          {/* Compact Persistent Footer */}
+          <footer className="shrink-0 border-t border-slate-200 dark:border-white/10 bg-white/80 dark:bg-[#070B17]/85 backdrop-blur-md px-3 sm:px-6 py-1.5 print:hidden">
+            <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-400">
+              <span>Nova AI · منصة الذكاء الاصطناعي العربية</span>
+              <div className="flex items-center gap-3 sm:gap-4">
+                <button
+                  type="button"
+                  onClick={() => navigateTo('help')}
+                  className="hover:text-slate-900 dark:hover:text-white cursor-pointer transition-colors"
+                >
+                  المساعدة
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigateTo('faq')}
+                  className="hover:text-slate-900 dark:hover:text-white cursor-pointer transition-colors"
+                >
+                  الأسئلة الشائعة
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigateTo('privacy')}
+                  className="hover:text-slate-900 dark:hover:text-white underline underline-offset-4 cursor-pointer transition-colors font-medium"
+                >
+                  سياسة الخصوصية
+                </button>
+              </div>
+            </div>
+          </footer>
         </div>
       )}
       <OfflineIndicator />

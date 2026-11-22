@@ -18,13 +18,15 @@ export default defineConfig(() => {
           'pwa-192x192.png',
           'pwa-512x512.png',
           'pwa-maskable-512x512.png',
+          'robots.txt',
+          'sitemap.xml',
         ],
         manifest: {
           id: '/',
           name: 'Nova AI',
           short_name: 'Nova AI',
           description:
-            'Nova AI — مساعد ذكاء اصطناعي عربي شخصي فاخر للمحادثة الذكية، تحليل الصور، والتخطيط والإنتاجية.',
+            'منصة Nova AI العربية للذكاء الاصطناعي: محادثة ذكية فورية، محادثة صوتية، تحليل الصور، صانع عروض PowerPoint وPDF، وبناء الاختبارات المدرسية.',
           lang: 'ar',
           dir: 'rtl',
           theme_color: '#050711',
@@ -61,7 +63,7 @@ export default defineConfig(() => {
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           navigateFallback: '/index.html',
-          navigateFallbackDenylist: [/^\/api\//, /^\/__\//],
+          navigateFallbackDenylist: [/^\/api\//, /^\/__\//, /^\/sitemap\.xml$/, /^\/robots\.txt$/],
           runtimeCaching: [
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,

@@ -18,7 +18,12 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const firebaseConfigPath = path.resolve(__dirname, 'firebase-applet-config.json');
+const firebaseConfigPath =
+  [
+    path.resolve(__dirname, 'firebase-applet-config.json'),
+    path.resolve(__dirname, '..', 'firebase-applet-config.json'),
+    path.resolve(process.cwd(), 'firebase-applet-config.json'),
+  ].find((candidate) => fs.existsSync(candidate)) || path.resolve(__dirname, 'firebase-applet-config.json');
 const firebaseConfig = fs.existsSync(firebaseConfigPath)
   ? JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf-8'))
   : null;
@@ -348,15 +353,44 @@ interface AuthedRequest extends Request {
 
 const OWNER_ADMIN_EMAIL = 'amjad.alqasmi67@gmail.com';
 const OTP_COOKIE_NAME = 'nova_otp_session';
+const OTP_CHALLENGE_COOKIE_NAME = 'nova_otp_challenge';
 const OTP_SIGNING_SECRET =
-  process.env.OTP_SIGNING_SECRET?.trim() ||
-  crypto
-    .createHmac(
-      'sha256',
-      `${process.env.GEMINI_API_KEY || 'nova'}:${firebaseConfig?.apiKey || 'fb'}:${firebaseConfig?.projectId || 'proj'}`
-    )
-    .update('nova-ai-otp-signing-v1')
-    .digest('hex');
+  process.env.OTP_SIGNING_SECRET?.trim() || crypto.randomBytes(32).toString('hex');
+
+const CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g;
+
+function sanitizeTextInput(raw: unknown, maxLength: number, preserveNewlines = true): string {
+  if (typeof raw !== 'string') return '';
+  let cleaned = raw.replace(CONTROL_CHARS_RE, '');
+  if (!preserveNewlines) {
+    cleaned = cleaned.replace(/[\r\n\t]+/g, ' ');
+  }
+  return cleaned.trim().slice(0, maxLength);
+}
+
+function isSafeExternalUrl(rawUrl: string): string | null {
+  const cleaned = sanitizeTextInput(rawUrl, 1000, false);
+  if (!cleaned) return null;
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    if (parsed.username || parsed.password) return null;
+    const host = parsed.hostname.toLowerCase();
+    const isPrivateHost =
+      host === 'localhost' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      host.startsWith('127.') ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      host.startsWith('169.254.') ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+    if (isPrivateHost) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
 
 const authTokenCache = new Map<string, { uid: string; email: string; authTime: number; expiresAt: number }>();
 
@@ -448,7 +482,8 @@ interface SecurityEventEntry {
     | 'csrf_origin_block'
     | 'prototype_pollution_block'
     | 'auth_ban'
-    | 'otp_lockout';
+    | 'otp_lockout'
+    | 'rate_limit_block';
   maskedIp: string;
   path: string;
   timestamp: number;
@@ -465,7 +500,10 @@ interface OtpChallengeRecord {
 }
 
 const ipApiWindows = new Map<string, RateWindow>();
-const userAiWindows = new Map<string, RateWindow>();
+const userAuthWindows = new Map<string, RateWindow>();
+const userAiMinuteWindows = new Map<string, RateWindow>();
+const userAiHourlyWindows = new Map<string, RateWindow>();
+const userStudioBurstWindows = new Map<string, RateWindow>();
 const authFailWindows = new Map<string, RateWindow>();
 const suspicionProbeWindows = new Map<string, RateWindow>();
 const wsActiveByIp = new Map<string, number>();
@@ -476,17 +514,31 @@ const securityEvents: SecurityEventEntry[] = [];
 
 setInterval(() => {
   const now = Date.now();
-  const cutoff = now - 15 * 60_000;
-  for (const store of [ipApiWindows, userAiWindows, authFailWindows, suspicionProbeWindows]) {
+  const shortCutoff = now - 15 * 60_000;
+  for (const store of [
+    ipApiWindows,
+    userAuthWindows,
+    userAiMinuteWindows,
+    userStudioBurstWindows,
+    authFailWindows,
+    suspicionProbeWindows,
+  ]) {
     for (const [key, entry] of store.entries()) {
-      entry.timestamps = entry.timestamps.filter((t) => t > cutoff);
+      entry.timestamps = entry.timestamps.filter((t) => t > shortCutoff);
       if (entry.timestamps.length === 0 && entry.blockedUntil < now) {
         store.delete(key);
       }
     }
   }
+  const hourCutoff = now - 60 * 60_000;
+  for (const [key, entry] of userAiHourlyWindows.entries()) {
+    entry.timestamps = entry.timestamps.filter((t) => t > hourCutoff);
+    if (entry.timestamps.length === 0 && entry.blockedUntil < now) {
+      userAiHourlyWindows.delete(key);
+    }
+  }
   for (const [uid, rec] of otpChallenges.entries()) {
-    if (rec.expiresAt < now && rec.lockedUntil < now) {
+    if (rec.expiresAt < now && rec.lockedUntil < now && rec.requestHistory.every((t) => now - t > 60 * 60_000)) {
       otpChallenges.delete(uid);
     }
   }
@@ -768,7 +820,7 @@ function setOtpSessionCookie(req: Request, res: Response, token: string): void {
   const attrs = isHttps
     ? `Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSec}`
     : `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}`;
-  res.setHeader('Set-Cookie', `${OTP_COOKIE_NAME}=${encodeURIComponent(token)}; ${attrs}`);
+  res.append('Set-Cookie', `${OTP_COOKIE_NAME}=${encodeURIComponent(token)}; ${attrs}`);
 }
 
 function clearOtpSessionCookie(req: Request, res: Response): void {
@@ -776,7 +828,72 @@ function clearOtpSessionCookie(req: Request, res: Response): void {
   const attrs = isHttps
     ? 'Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0'
     : 'Path=/; HttpOnly; SameSite=Lax; Max-Age=0';
-  res.setHeader('Set-Cookie', `${OTP_COOKIE_NAME}=; ${attrs}`);
+  res.append('Set-Cookie', `${OTP_COOKIE_NAME}=; ${attrs}`);
+}
+
+function setOtpChallengeCookie(
+  req: Request,
+  res: Response,
+  uid: string,
+  salt: string,
+  codeHash: string,
+  expiresAt: number
+): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const payload = Buffer.from(JSON.stringify({ uid, salt, codeHash, exp: expiresAt }), 'utf-8').toString('base64url');
+  const sig = crypto.createHmac('sha256', OTP_SIGNING_SECRET).update(`challenge:${payload}`).digest('base64url');
+  const token = `${payload}.${sig}`;
+  const attrs = isHttps
+    ? 'Path=/; HttpOnly; Secure; SameSite=None; Max-Age=300'
+    : 'Path=/; HttpOnly; SameSite=Lax; Max-Age=300';
+  res.append('Set-Cookie', `${OTP_CHALLENGE_COOKIE_NAME}=${encodeURIComponent(token)}; ${attrs}`);
+}
+
+function clearOtpChallengeCookie(req: Request, res: Response): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const attrs = isHttps
+    ? 'Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0'
+    : 'Path=/; HttpOnly; SameSite=Lax; Max-Age=0';
+  res.append('Set-Cookie', `${OTP_CHALLENGE_COOKIE_NAME}=; ${attrs}`);
+}
+
+function readVerifiedOtpChallengeCookie(
+  cookieHeader: string | undefined,
+  uid: string
+): { salt: string; codeHash: string; expiresAt: number } | null {
+  const token = parseCookieValue(cookieHeader, OTP_CHALLENGE_COOKIE_NAME);
+  if (!token || !token.includes('.')) return null;
+  const [payloadB64, sigB64] = token.split('.');
+  if (!payloadB64 || !sigB64) return null;
+  const expectedSig = crypto
+    .createHmac('sha256', OTP_SIGNING_SECRET)
+    .update(`challenge:${payloadB64}`)
+    .digest('base64url');
+  const sigBuf = Buffer.from(sigB64, 'utf-8');
+  const expectedBuf = Buffer.from(expectedSig, 'utf-8');
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8')) as {
+      uid?: string;
+      salt?: string;
+      codeHash?: string;
+      exp?: number;
+    };
+    if (
+      parsed.uid !== uid ||
+      typeof parsed.salt !== 'string' ||
+      typeof parsed.codeHash !== 'string' ||
+      typeof parsed.exp !== 'number' ||
+      parsed.exp < Date.now()
+    ) {
+      return null;
+    }
+    return { salt: parsed.salt, codeHash: parsed.codeHash, expiresAt: parsed.exp };
+  } catch {
+    return null;
+  }
 }
 
 function hashOtpCode(uid: string, salt: string, code: string): string {
@@ -951,11 +1068,11 @@ async function requireFirebaseAuth(req: AuthedRequest, res: Response, next: Next
       return;
     }
 
-    const aiQuota = consumeRateQuota(userAiWindows, `${verified.uid}:${ip}`, 25, 60_000);
-    if (!aiQuota.allowed) {
-      res.setHeader('Retry-After', String(aiQuota.retryAfterSec));
+    const authQuota = consumeRateQuota(userAuthWindows, verified.uid, 60, 60_000);
+    if (!authQuota.allowed) {
+      res.setHeader('Retry-After', String(authQuota.retryAfterSec));
       res.status(429).json({
-        error: `تم تجاوز حد الطلبات السريع لحماية الخدمة. يرجى الانتظار ${aiQuota.retryAfterSec} ثانية.`,
+        error: `تم تجاوز حد الطلبات السريع لحماية الخدمة. يرجى الانتظار ${authQuota.retryAfterSec} ثانية.`,
       });
       return;
     }
@@ -975,6 +1092,52 @@ async function requireFirebaseAuth(req: AuthedRequest, res: Response, next: Next
   }
 }
 
+function checkUserAiQuotas(uid: string, isHeavyStudio: boolean): { allowed: boolean; retryAfterSec: number; reason?: string } {
+  const minuteQuota = consumeRateQuota(userAiMinuteWindows, uid, 15, 60_000);
+  if (!minuteQuota.allowed) {
+    return {
+      allowed: false,
+      retryAfterSec: minuteQuota.retryAfterSec,
+      reason: `تم تجاوز الحد المسموح لطلبات الذكاء الاصطناعي في الدقيقة (15 طلب/دقيقة). يرجى الانتظار ${minuteQuota.retryAfterSec} ثانية.`,
+    };
+  }
+  const hourlyQuota = consumeRateQuota(userAiHourlyWindows, uid, 120, 60 * 60_000);
+  if (!hourlyQuota.allowed) {
+    return {
+      allowed: false,
+      retryAfterSec: hourlyQuota.retryAfterSec,
+      reason: 'وصلت إلى الحد الساعي الأقصى لاستخدام الذكاء الاصطناعي لحماية حصة الخدمة. يرجى المحاولة لاحقًا.',
+    };
+  }
+  if (isHeavyStudio) {
+    const studioQuota = consumeRateQuota(userStudioBurstWindows, uid, 15, 15 * 60_000);
+    if (!studioQuota.allowed) {
+      return {
+        allowed: false,
+        retryAfterSec: studioQuota.retryAfterSec,
+        reason: `وصلت إلى الحد المؤقت لإنشاء العروض والاختبارات (15 عملية كل 15 دقيقة). يرجى الانتظار ${studioQuota.retryAfterSec} ثانية.`,
+      };
+    }
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function requireAiQuota(req: AuthedRequest, res: Response, next: NextFunction) {
+  if (!req.uid) {
+    res.status(401).json({ error: 'يجب تسجيل الدخول أولاً.' });
+    return;
+  }
+  const isHeavyStudio = req.path === '/generate-pptx' || req.path === '/generate-exam';
+  const result = checkUserAiQuotas(req.uid, isHeavyStudio);
+  if (!result.allowed) {
+    recordSecurityEvent('rate_limit_block', getClientIp(req), req.originalUrl);
+    res.setHeader('Retry-After', String(result.retryAfterSec));
+    res.status(429).json({ error: result.reason });
+    return;
+  }
+  next();
+}
+
 function requireOtpIfConfigured(req: AuthedRequest, res: Response, next: NextFunction) {
   if (!isOtpDeliveryConfigured()) {
     next();
@@ -990,7 +1153,7 @@ function requireOtpIfConfigured(req: AuthedRequest, res: Response, next: NextFun
   next();
 }
 
-async function startServer() {
+export function createNovaApiApp(): express.Express {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
@@ -1097,6 +1260,7 @@ async function startServer() {
       service: 'Nova AI',
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
       otpConfigured: isOtpDeliveryConfigured(),
+      liveWsSupported: process.env.VERCEL !== '1',
     });
   });
 
@@ -1146,6 +1310,7 @@ async function startServer() {
       }
     }
     clearOtpSessionCookie(req, res);
+    clearOtpChallengeCookie(req, res);
     res.json({ ok: true });
   });
 
@@ -1191,19 +1356,34 @@ async function startServer() {
       const code = String(crypto.randomInt(100000, 1000000));
       const salt = crypto.randomBytes(16).toString('hex');
       const codeHash = hashOtpCode(req.uid, salt, code);
+      const updatedHistory = [...history, now];
 
-      await sendOtpEmail(req.userEmail, code);
-
+      const expiresAt = now + 5 * 60_000;
       otpChallenges.set(req.uid, {
         salt,
         codeHash,
-        expiresAt: now + 5 * 60_000,
+        expiresAt,
         lastSentAt: now,
         failedAttempts: 0,
         lockedUntil: 0,
-        requestHistory: [...history, now],
+        requestHistory: updatedHistory,
       });
 
+      try {
+        await sendOtpEmail(req.userEmail, code);
+      } catch (sendErr) {
+        // Invalidate the unsent challenge code while retaining requestHistory cooldown to prevent spam
+        const cur = otpChallenges.get(req.uid);
+        if (cur) {
+          cur.codeHash = '';
+          cur.salt = '';
+          cur.expiresAt = 0;
+        }
+        clearOtpChallengeCookie(req, res);
+        throw sendErr;
+      }
+
+      setOtpChallengeCookie(req, res, req.uid, salt, codeHash, expiresAt);
       res.json({
         sent: true,
         emailMasked: maskEmailAddress(req.userEmail),
@@ -1244,8 +1424,23 @@ async function startServer() {
       return;
     }
 
-    const challenge = otpChallenges.get(req.uid);
     const now = Date.now();
+    let challenge = otpChallenges.get(req.uid);
+    if (!challenge) {
+      const cookieChallenge = readVerifiedOtpChallengeCookie(req.headers.cookie, req.uid);
+      if (cookieChallenge) {
+        challenge = {
+          salt: cookieChallenge.salt,
+          codeHash: cookieChallenge.codeHash,
+          expiresAt: cookieChallenge.expiresAt,
+          lastSentAt: now,
+          failedAttempts: 0,
+          lockedUntil: 0,
+          requestHistory: [],
+        };
+        otpChallenges.set(req.uid, challenge);
+      }
+    }
     if (!challenge) {
       res.status(400).json({ error: 'لا يوجد رمز تحقق نشط. اضغط على إعادة إرسال الرمز.' });
       return;
@@ -1255,8 +1450,9 @@ async function startServer() {
       res.status(429).json({ error: `محاولات خاطئة متكررة. حاول مجددًا بعد ${waitSec} ثانية.` });
       return;
     }
-    if (challenge.expiresAt < now) {
+    if (!challenge.codeHash || !challenge.salt || challenge.expiresAt < now) {
       otpChallenges.delete(req.uid);
+      clearOtpChallengeCookie(req, res);
       res.status(400).json({ error: 'انتهت صلاحية الرمز. اطلب رمزًا جديدًا.' });
       return;
     }
@@ -1268,8 +1464,12 @@ async function startServer() {
       challenge.failedAttempts += 1;
       if (challenge.failedAttempts >= 5) {
         challenge.lockedUntil = now + 10 * 60_000;
+        challenge.codeHash = '';
+        challenge.salt = '';
+        challenge.expiresAt = 0;
+        clearOtpChallengeCookie(req, res);
         recordSecurityEvent('otp_lockout', ip, req.originalUrl);
-        res.status(429).json({ error: 'تم إدخال الرمز بشكل خاطئ 5 مرات. تم قفل التحقق لمدة 10 دقائق.' });
+        res.status(429).json({ error: 'تم إدخال الرمز بشكل خاطئ 5 مرات. تم إلغاء الرمز وقفل التحقق لمدة 10 دقائق.' });
         return;
       }
       res.status(401).json({ error: `رمز التحقق غير صحيح (المتبقي ${5 - challenge.failedAttempts} محاولات).` });
@@ -1277,29 +1477,35 @@ async function startServer() {
     }
 
     otpChallenges.delete(req.uid);
+    clearOtpChallengeCookie(req, res);
     const issued = issueOtpSessionToken(req.uid, authTime);
     markAuthSessionOtpVerified(req.uid, authTime, issued.expiresAt);
     setOtpSessionCookie(req, res, issued.token);
     res.json({ verified: true, otpToken: issued.token, expiresAt: issued.expiresAt });
   });
 
-  app.get('/api/owner/security-events', requireFirebaseAuth, (req: AuthedRequest, res: Response) => {
-    if ((req.userEmail || '').toLowerCase() !== OWNER_ADMIN_EMAIL) {
-      res.status(403).json({ error: 'هذه الصلاحية مخصصة لمالك الموقع فقط.' });
-      return;
+  app.get(
+    '/api/owner/security-events',
+    requireFirebaseAuth,
+    requireOtpIfConfigured,
+    (req: AuthedRequest, res: Response) => {
+      if ((req.userEmail || '').toLowerCase() !== OWNER_ADMIN_EMAIL) {
+        res.status(403).json({ error: 'هذه الصلاحية مخصصة لمالك الموقع فقط.' });
+        return;
+      }
+      res.json({
+        otpConfigured: isOtpDeliveryConfigured(),
+        activeBannedIps: countActiveBannedIps(),
+        totalBlockedEvents: securityEvents.length,
+        recentEvents: securityEvents.slice(0, 25),
+      });
     }
-    res.json({
-      otpConfigured: isOtpDeliveryConfigured(),
-      activeBannedIps: countActiveBannedIps(),
-      totalBlockedEvents: securityEvents.length,
-      recentEvents: securityEvents.slice(0, 25),
-    });
-  });
+  );
 
-  app.use('/api/nova', requireFirebaseAuth, requireOtpIfConfigured);
+  app.use('/api/nova', requireFirebaseAuth, requireOtpIfConfigured, requireAiQuota);
 
   // 1. Fast & Resilient Arabic Chat Endpoint (Supports NDJSON Streaming + JSON)
-  app.post('/api/nova/chat', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/nova/chat', async (req: AuthedRequest, res: Response) => {
     let isStreamingStarted = false;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1358,6 +1564,7 @@ async function startServer() {
 
       const ai = getAiClient();
 
+      const cleanCustomInstruction = sanitizeTextInput(customInstruction, 1000);
       const baseInstruction = [
         'أنت Nova AI، مساعد ذكاء اصطناعي شخصي ذكي وسريع ودقيق.',
         'التزم بالرد دائمًا باللغة العربية الفصحى الواضحة والأنيقة على كل رسالة يرسلها المستخدم، وافهم طلبه بدقة ونفّذه مباشرة.',
@@ -1365,9 +1572,7 @@ async function startServer() {
         thinkingDepth === 'high'
           ? 'في وضع التحليل العميق والأسئلة الصعبة أو العلمية أو البرمجية المعقدة، قدّم حلاً دقيقًا ومفصلًا ومنظمًا بخطوات واضحة وأمثلة أو أكواد عملية عند الحاجة.'
           : 'أجب بسرعة وإيجاز مباشر: ادخل في صلب الإجابة فورًا دون مقدمات مكررة أو حشو، وقدّم نقاطًا واضحة أو أكوادًا عملية عند الحاجة.',
-        customInstruction?.trim()
-          ? `\nتعليمات المستخدم الشخصية المخصصة:\n${customInstruction.trim()}`
-          : '',
+        cleanCustomInstruction ? `\nتعليمات المستخدم الشخصية المخصصة:\n${cleanCustomInstruction}` : '',
       ]
         .filter(Boolean)
         .join('\n');
@@ -1376,7 +1581,7 @@ async function startServer() {
       const recentMessages = messages.slice(-8);
       const rawContents = recentMessages
         .filter((m) => {
-          const hasText = typeof m.content === 'string' && m.content.trim().length > 0;
+          const hasText = typeof m.content === 'string' && sanitizeTextInput(m.content, 25000).length > 0;
           const hasImg = Boolean(m.attachment?.data && m.attachment?.mimeType);
           return hasText || hasImg;
         })
@@ -1392,7 +1597,7 @@ async function startServer() {
             });
           }
           const isLatestTurn = idx === recentMessages.length - 1;
-          const rawText = typeof msg.content === 'string' ? msg.content.trim() : '';
+          const rawText = sanitizeTextInput(msg.content, 25000);
           const cleanText = rawText || (hasImg ? 'حلّل هذه الصورة بالتفصيل واشرح ما يظهر فيها بدقة.' : '');
           parts.push({ text: isLatestTurn ? cleanText : cleanText.slice(0, 2500) });
           return {
@@ -1575,7 +1780,7 @@ async function startServer() {
   });
 
   // 2. Automatic AI Triage for Contact Us Messages
-  app.post('/api/nova/contact-triage', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/nova/contact-triage', async (req: AuthedRequest, res: Response) => {
     try {
       const { senderName, category = 'general', message } = req.body as {
         senderName?: string;
@@ -1583,14 +1788,17 @@ async function startServer() {
         message?: string;
       };
 
-      if (!message || typeof message !== 'string' || message.trim().length < 5) {
+      const cleanMessage = sanitizeTextInput(message, 3000);
+      if (cleanMessage.length < 5) {
         res.status(400).json({ error: 'محتوى الرسالة قصير جدًا للتحليل.' });
         return;
       }
+      const cleanSenderName = sanitizeTextInput(senderName, 120, false) || 'مستخدم';
+      const safeCategory = category === 'issue' || category === 'suggestion' ? category : 'general';
 
       const ai = getAiClient();
       const categoryLabel =
-        category === 'issue' ? 'مشكلة تقنية' : category === 'suggestion' ? 'اقتراح تطوير' : 'استفسار عام';
+        safeCategory === 'issue' ? 'مشكلة تقنية' : safeCategory === 'suggestion' ? 'اقتراح تطوير' : 'استفسار عام';
 
       const systemInstruction = [
         'أنت محلل الدعم الفني والرد الذكي في منصة Nova AI.',
@@ -1602,9 +1810,9 @@ async function startServer() {
       ].join('\n');
 
       const userPrompt = [
-        `اسم المرسل: ${(senderName || 'مستخدم').trim()}`,
+        `اسم المرسل: ${cleanSenderName}`,
         `التصنيف المختار: ${categoryLabel}`,
-        `نص الرسالة:\n${message.trim()}`,
+        `نص الرسالة:\n${cleanMessage}`,
       ].join('\n');
 
       const attempts: Array<{ model: string; thinkingLevel: ThinkingLevel; delayMs: number }> = [
@@ -1669,7 +1877,7 @@ async function startServer() {
           res.json({
             classification,
             reply: reply.slice(0, 4000),
-            summary: (summary || message.trim().slice(0, 120)).slice(0, 500),
+            summary: (summary || cleanMessage.slice(0, 120)).slice(0, 500),
             model: attempt.model,
           });
           return;
@@ -1697,14 +1905,14 @@ async function startServer() {
   });
 
   // 3. Text-to-Speech Endpoint for Listening to Nova AI Replies
-  app.post('/api/nova/tts', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/nova/tts', async (req: AuthedRequest, res: Response) => {
     try {
       const { text, voiceName = 'Kore' } = req.body as {
         text?: string;
         voiceName?: string;
       };
 
-      const cleanText = (text || '')
+      const cleanText = sanitizeTextInput(text, 2500)
         .replace(/https?:\/\/\S+/g, ' ')
         .replace(/```[\s\S]*?```/g, ' ')
         .replace(/[*#`>_~[\](){}|\\]/g, ' ')
@@ -1720,7 +1928,7 @@ async function startServer() {
 
       const ai = getAiClient();
       const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-      const chosenVoice = allowedVoices.includes(voiceName) ? voiceName : 'Kore';
+      const chosenVoice = typeof voiceName === 'string' && allowedVoices.includes(voiceName) ? voiceName : 'Kore';
 
       let base64Audio: string | null = null;
       let lastTtsError: unknown;
@@ -1776,7 +1984,7 @@ async function startServer() {
   });
 
   // 4. Turn-Based Voice Conversation Fallback Endpoint (Audio -> Transcript + Reply + Spoken Audio)
-  app.post('/api/nova/voice-turn', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/nova/voice-turn', async (req: AuthedRequest, res: Response) => {
     try {
       const { audioBase64, mimeType = 'audio/webm', history = [], customInstruction, voiceName = 'Kore' } = req.body as {
         audioBase64?: string;
@@ -1810,16 +2018,21 @@ async function startServer() {
 
       const ai = getAiClient();
       const safeHistory = Array.isArray(history)
-        ? history.slice(-6).map((h) => `${h.role === 'assistant' ? 'Nova AI' : 'المستخدم'}: ${h.content.slice(0, 600)}`).join('\n')
+        ? history
+            .filter((h) => h && typeof h.content === 'string')
+            .slice(-6)
+            .map((h) => `${h.role === 'assistant' ? 'Nova AI' : 'المستخدم'}: ${sanitizeTextInput(h.content, 600)}`)
+            .join('\n')
         : '';
 
+      const cleanCustomInstruction = sanitizeTextInput(customInstruction, 1000);
       const systemInstruction = [
         'أنت Nova AI في محادثة صوتية طبيعية وودية باللغة العربية فقط.',
         'قواعد صارمة:',
         '- استمع إلى التسجيل الصوتي للمستخدم، واكتب النص العربي الدقيق لما قاله في حقل userTranscript.',
         '- أجب عليه باللغة العربية الفصحى الواضحة والسليمة فقط في حقل replyText.',
         '- ممنوع تمامًا خلط الإنجليزية أو كتابة كلمات أجنبية أو رموز برمجية أو نجوم تنسيق داخل replyText إلا إذا طلب المستخدم ترجمة أو كلمة أجنبية صراحةً؛ اكتب الأرقام والمصطلحات بنطق عربي واضح ومفهوم.',
-        customInstruction?.trim() ? `تعليمات المستخدم الشخصية:\n${customInstruction.trim()}` : '',
+        cleanCustomInstruction ? `تعليمات المستخدم الشخصية:\n${cleanCustomInstruction}` : '',
       ]
         .filter(Boolean)
         .join('\n');
@@ -1882,7 +2095,7 @@ async function startServer() {
 
       let audioReplyBase64: string | null = null;
       const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-      const chosenVoice = allowedVoices.includes(voiceName) ? voiceName : 'Kore';
+      const chosenVoice = typeof voiceName === 'string' && allowedVoices.includes(voiceName) ? voiceName : 'Kore';
       const cleanSpeechText = replyText
         .replace(/https?:\/\/\S+/g, ' ')
         .replace(/[*#`>_~[\](){}|\\]/g, ' ')
@@ -1941,7 +2154,7 @@ async function startServer() {
   });
 
   // 5. Structured PowerPoint (.pptx) Deck Generation Endpoint
-  app.post('/api/nova/generate-pptx', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/nova/generate-pptx', async (req: AuthedRequest, res: Response) => {
     try {
       const {
         topic,
@@ -1950,6 +2163,10 @@ async function startServer() {
         audience = 'عام',
         language = 'ar',
         stream = false,
+        batchIndex = 1,
+        totalBatches = 1,
+        existingSlideTitles = [],
+        targetDeckTitle = '',
       } = req.body as {
         topic?: string;
         details?: string;
@@ -1957,18 +2174,33 @@ async function startServer() {
         audience?: string;
         language?: 'ar' | 'en';
         stream?: boolean;
+        batchIndex?: number;
+        totalBatches?: number;
+        existingSlideTitles?: string[];
+        targetDeckTitle?: string;
       };
 
-      const cleanTopic = typeof topic === 'string' ? topic.trim().slice(0, 240) : '';
+      const cleanTopic = sanitizeTextInput(topic, 240, false);
       if (!cleanTopic || cleanTopic.length < 2) {
         res.status(400).json({ error: 'يرجى إدخال عنوان أو موضوع العرض التقديمي.' });
         return;
       }
-      const safeDetails = typeof details === 'string' ? details.slice(0, 6000) : '';
-      const safeAudience = typeof audience === 'string' ? audience.slice(0, 160) : 'عام';
+      const safeDetails = sanitizeTextInput(details, 6000);
+      const safeAudience = sanitizeTextInput(audience, 160, false) || 'عام';
       const safeLanguage = language === 'en' ? 'en' : 'ar';
 
-      const targetSlides = Math.min(18, Math.max(4, Number(slideCount) || 8));
+      const targetSlides = Math.min(18, Math.max(2, Number(slideCount) || 8));
+      const safeTotalBatches = Math.min(4, Math.max(1, Math.round(Number(totalBatches) || 1)));
+      const safeBatchIndex = Math.min(safeTotalBatches, Math.max(1, Math.round(Number(batchIndex) || 1)));
+      const isFirstBatch = safeBatchIndex === 1;
+      const isLastBatch = safeBatchIndex === safeTotalBatches;
+      const cleanExistingTitles = Array.isArray(existingSlideTitles)
+        ? existingSlideTitles
+            .map((t) => sanitizeTextInput(t, 120, false))
+            .filter(Boolean)
+            .slice(0, 20)
+        : [];
+      const cleanTargetDeckTitle = sanitizeTextInput(targetDeckTitle, 160, false);
       const ai = getAiClient();
 
       let isStreamingStarted = false;
@@ -1999,10 +2231,28 @@ async function startServer() {
             cleanupHeartbeat();
           }
         });
-        writeEvent({ type: 'status', message: 'جاري تخطيط وبناء شرائح PowerPoint...' });
+        writeEvent({
+          type: 'status',
+          message:
+            safeTotalBatches > 1
+              ? `جاري بناء الجزء ${safeBatchIndex} من ${safeTotalBatches} لتسريع إنشاء العرض...`
+              : 'جاري تخطيط وبناء شرائح PowerPoint...',
+        });
         heartbeatTimer = setInterval(() => {
           writeEvent({ type: 'ping' });
         }, 1500);
+      }
+
+      const layoutRules: string[] = [];
+      if (isFirstBatch) {
+        layoutRules.push('- الشريحة الأولى في هذه الدفعة يجب أن تكون بنوع layout="title" (شريحة الغلاف).');
+      } else {
+        layoutRules.push('- لا تنشئ شريحة غلاف layout="title" في هذه الدفعة؛ ابدأ مباشرة بشرائح المحتوى لاستكمال العرض.');
+      }
+      if (isLastBatch) {
+        layoutRules.push('- الشريحة الأخيرة في هذه الدفعة يجب أن تكون بنوع layout="conclusion" (الخلاصة والتوصيات).');
+      } else {
+        layoutRules.push('- لا تنشئ شريحة ختامية layout="conclusion" بعد؛ سيتبعها جزء آخر يستكمل العرض.');
       }
 
       const systemInstruction = [
@@ -2011,24 +2261,29 @@ async function startServer() {
         safeLanguage === 'en'
           ? 'Write all slide titles, bullets, metrics, and speaker notes in crisp, executive English.'
           : 'اكتب جميع عناوين الشرائح ونقاط المحتوى والإحصائيات وملاحظات المتحدث باللغة العربية الفصحى الدقيقة والواضحة.',
-        `العدد المطلوب للشرائح هو بالضبط ${targetSlides} شريحة:`,
-        '- الشريحة الأولى يجب أن تكون بنوع layout="title" (شريحة الغلاف).',
-        '- الشريحة الأخيرة يجب أن تكون بنوع layout="conclusion" (الخلاصة والتوصيات).',
+        `العدد المطلوب للشرائح في هذه الدفعة هو بالضبط ${targetSlides} شريحة:`,
+        ...layoutRules,
         '- نوّع الشرائح الوسطى بين "bullets" و"two-column" (للمقارنات أو المحاور المزدوجة، واملأ rightColumnTitle و rightColumnBullets بوضوح) و"metrics" (للأرقام والمؤشرات أو المعالم الأساسية في حقل metrics).',
-        '- اجعل كل شريحة متوازنة ومنسقة للعرض (3 إلى 5 نقاط مركزة وغنية بالمعلومة في كل شريحة، وتجنب الفقرات الطويلة المزدحمة).',
+        '- اجعل كل شريحة متوازنة ومنسقة للعرض (3 إلى 5 نقاط مركزة وغنية بالمعلومة في كل شريحة، وتجنب الفقرات الطويلة المزدحمة لضمان السرعة والوضوح).',
       ].join('\n');
 
       const userPrompt = [
         `موضوع العرض الرئيسي: ${cleanTopic}`,
+        cleanTargetDeckTitle ? `عنوان العرض المعتمد: ${cleanTargetDeckTitle}` : '',
         safeDetails.trim() ? `التفاصيل والمحاور الدقيقة التي يريدها المستخدم:\n${safeDetails.trim()}` : '',
         `الجمهور المستهدف: ${safeAudience.trim() || 'عام'}`,
-        `عدد الشرائح المطلوب: ${targetSlides}`,
+        safeTotalBatches > 1
+          ? `هذه الدفعة رقم ${safeBatchIndex} من أصل ${safeTotalBatches} دفعات. أنشئ ${targetSlides} شريحة لهذه الدفعة فقط.`
+          : `عدد الشرائح المطلوب: ${targetSlides}`,
+        cleanExistingTitles.length > 0
+          ? `عناوين الشرائح التي تم إنشاؤها بالفعل في الدفعة السابقة (تجنّب تكرارها وتابع تسلسل العرض منطقيًا):\n- ${cleanExistingTitles.join('\n- ')}`
+          : '',
       ]
         .filter(Boolean)
         .join('\n\n');
 
       const attempts: Array<{ model: string; level: ThinkingLevel; timeoutMs: number }> = [
-        { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.LOW, timeoutMs: 22000 },
+        { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MINIMAL, timeoutMs: 24000 },
         { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW, timeoutMs: 26000 },
       ];
 
@@ -2117,7 +2372,7 @@ async function startServer() {
             }
 
             const resultPayload = {
-              deckTitle: (parsed.deckTitle || cleanTopic).trim(),
+              deckTitle: (parsed.deckTitle || cleanTargetDeckTitle || cleanTopic).trim(),
               deckSubtitle: (parsed.deckSubtitle || '').trim(),
               slides: parsed.slides,
               model: attempt.model,
@@ -2161,12 +2416,13 @@ async function startServer() {
   });
 
   // 6. Curriculum & Electronic Library Exam Generator Endpoint (Always 4 fixed options per question)
-  app.post('/api/nova/generate-exam', requireFirebaseAuth, async (req: AuthedRequest, res: Response) => {
+  app.post('/api/nova/generate-exam', async (req: AuthedRequest, res: Response) => {
     try {
       const {
         curriculum = 'المناهج العُمانية (المكتبة الإلكترونية)',
         subjectGrade,
         lessonOrPages,
+        lessonContent = '',
         questionCount = 5,
         difficulty = 'mixed',
         sourceUrl = '',
@@ -2175,6 +2431,7 @@ async function startServer() {
         curriculum?: string;
         subjectGrade?: string;
         lessonOrPages?: string;
+        lessonContent?: string;
         questionCount?: number;
         difficulty?: 'mixed' | 'easy' | 'medium' | 'hard';
         sourceUrl?: string;
@@ -2182,11 +2439,10 @@ async function startServer() {
       };
 
       const cleanCurriculum =
-        typeof curriculum === 'string' && curriculum.trim().length > 0
-          ? curriculum.trim().slice(0, 160)
-          : 'المناهج العُمانية (المكتبة الإلكترونية)';
-      const cleanSubjectGrade = typeof subjectGrade === 'string' ? subjectGrade.trim().slice(0, 180) : '';
-      const cleanLessonOrPages = typeof lessonOrPages === 'string' ? lessonOrPages.trim().slice(0, 800) : '';
+        sanitizeTextInput(curriculum, 160, false) || 'المناهج العُمانية (المكتبة الإلكترونية)';
+      const cleanSubjectGrade = sanitizeTextInput(subjectGrade, 180, false);
+      const cleanLessonOrPages = sanitizeTextInput(lessonOrPages, 800);
+      const cleanLessonContent = sanitizeTextInput(lessonContent, 8000);
 
       if (cleanSubjectGrade.length < 2) {
         res.status(400).json({ error: 'يرجى تحديد المادة والصف الدراسي (مثال: رياضيات - الصف التاسع).' });
@@ -2210,28 +2466,12 @@ async function startServer() {
 
       let safeSourceUrl = '';
       if (typeof sourceUrl === 'string' && sourceUrl.trim().length > 0) {
-        try {
-          const parsedUrl = new URL(sourceUrl.trim());
-          const host = parsedUrl.hostname.toLowerCase();
-          const isPrivateHost =
-            host === 'localhost' ||
-            host === '::1' ||
-            host === '[::1]' ||
-            host.startsWith('127.') ||
-            host.startsWith('10.') ||
-            host.startsWith('192.168.') ||
-            host.startsWith('169.254.') ||
-            /^172\.(1[6-9]|2\d|3[01])\./.test(host);
-          if ((parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:') && !isPrivateHost) {
-            safeSourceUrl = parsedUrl.toString().slice(0, 500);
-          } else {
-            res.status(400).json({ error: 'رابط الكتاب أو المكتبة الإلكترونية غير صالح.' });
-            return;
-          }
-        } catch {
-          res.status(400).json({ error: 'صيغة رابط الكتاب الإلكتروني غير صحيحة.' });
+        const validated = isSafeExternalUrl(sourceUrl);
+        if (!validated) {
+          res.status(400).json({ error: 'رابط الكتاب أو المكتبة الإلكترونية غير صالح.' });
           return;
         }
+        safeSourceUrl = validated.slice(0, 500);
       }
 
       const ai = getAiClient();
@@ -2264,72 +2504,142 @@ async function startServer() {
             cleanupHeartbeat();
           }
         });
-        writeEvent({ type: 'status', message: 'جاري البحث في المكتبة الإلكترونية والكتاب المدرسي...' });
+        writeEvent({ type: 'status', message: 'جاري التحقق من محتوى الدرس في المكتبة الإلكترونية والكتاب المدرسي...' });
         heartbeatTimer = setInterval(() => {
           writeEvent({ type: 'ping' });
         }, 1500);
       }
 
       try {
-        // Step 1: Ground against Electronic Libraries & School Curriculum Books via Search Grounding (+ URL Context if provided)
-        let groundedLessonNotes = '';
         const bookSources: Array<{ title: string; url: string }> = [];
         const seenSourceUrls = new Set<string>();
+        let groundedLessonNotes = '';
+        let directUrlText = '';
+        let directUrlWasUnreadable = false;
+        let hasVerifiedUserText = cleanLessonContent.length >= 40;
 
-        try {
-          const searchTools: Array<Record<string, unknown>> = [{ googleSearch: {} }];
+        if (!hasVerifiedUserText) {
           if (safeSourceUrl) {
-            searchTools.push({ urlContext: {} });
-          }
-
-          const searchPrompt = [
-            'ابحث في المكتبة الإلكترونية الرسمية والمناهج الدراسية المعتمدة عن محتوى الدرس والصفحات المطلوبة بدقة:',
-            `- المنهج / المكتبة: ${cleanCurriculum}`,
-            `- المادة والصف: ${cleanSubjectGrade}`,
-            `- الدرس أو أرقام الصفحات المطلوبة: ${cleanLessonOrPages}`,
-            safeSourceUrl ? `- رابط الكتاب أو الصفحة المحددة من المستخدم: ${safeSourceUrl}` : '',
-            '',
-            'إذا كان المنهج عُمانيًا فابحث ضمن المكتبة الإلكترونية لوزارة التربية والتعليم (ict.moe.gov.om / elibrary.moe.gov.om) والمناهج العُمانية، وإن كان سعوديًا ففي بوابة عين وكتبي، وإن كان لدولة أخرى ففي مكتبتها التعليمية المعتمدة.',
-            'استخرج ملخصًا تعليميًا دقيقًا يتضمن: عنوان الوحدة والدرس، أرقام الصفحات إن توفرت، المفاهيم والقوانين الأساسية، الأمثلة المحلولة، ونقاط التقويم التي يرتكز عليها الكتاب المدرسي لهذا الدرس.',
-          ]
-            .filter(Boolean)
-            .join('\n');
-
-          const groundingRes = await ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: searchPrompt,
-            config: {
-              tools: searchTools as never,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              abortSignal: AbortSignal.timeout(12000),
-            },
-          });
-
-          groundedLessonNotes = extractGeminiText(groundingRes).slice(0, 6500);
-
-          const metadata = groundingRes.candidates?.[0]?.groundingMetadata as
-            | { groundingChunks?: Array<{ web?: { uri?: string; title?: string } }> }
-            | undefined;
-          if (Array.isArray(metadata?.groundingChunks)) {
-            for (const chunk of metadata.groundingChunks) {
-              const uri = chunk.web?.uri?.trim();
-              if (!uri || seenSourceUrls.has(uri)) continue;
-              if (!/^https?:\/\//i.test(uri)) continue;
-              seenSourceUrls.add(uri);
-              bookSources.push({
-                title: (chunk.web?.title || 'مصدر من المكتبة الإلكترونية').trim().slice(0, 140),
-                url: uri,
+            try {
+              const pageRes = await fetch(safeSourceUrl, {
+                redirect: 'follow',
+                headers: { 'User-Agent': 'NovaAI-CurriculumVerifier/1.0' },
+                signal: AbortSignal.timeout(6500),
               });
-              if (bookSources.length >= 6) break;
+              const cType = (pageRes.headers.get('content-type') || '').toLowerCase();
+              if (pageRes.ok && (cType.includes('text/html') || cType.includes('text/plain'))) {
+                const rawHtml = (await pageRes.text()).slice(0, 120000);
+                const stripped = rawHtml
+                  .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                  .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                  .replace(/<[^>]+>/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                  .slice(0, 5000);
+                if (stripped.length >= 120) {
+                  directUrlText = stripped;
+                } else {
+                  directUrlWasUnreadable = true;
+                }
+              } else {
+                directUrlWasUnreadable = true;
+              }
+            } catch {
+              directUrlWasUnreadable = true;
             }
           }
-        } catch (groundingErr) {
-          console.warn('[Nova AI Exam Grounding fallback]:', groundingErr);
-        }
 
-        if (clientDisconnected) {
-          cleanupHeartbeat();
-          return;
+          try {
+            const searchTools: Array<Record<string, unknown>> = [{ googleSearch: {} }];
+            if (safeSourceUrl) {
+              searchTools.push({ urlContext: {} });
+            }
+
+            const searchPrompt = [
+              'تحقق أولاً هل يتوفر محتوى حقيقي وموثوق لهذا الدرس والصفحات المطلوبة في المكتبة الإلكترونية أو المصادر التعليمية المعتمدة أو الرابط المرفق:',
+              `- المنهج / المكتبة: ${cleanCurriculum}`,
+              `- المادة والصف: ${cleanSubjectGrade}`,
+              `- الدرس أو أرقام الصفحات المطلوبة: ${cleanLessonOrPages}`,
+              safeSourceUrl ? `- رابط الكتاب أو الصفحة المحددة من المستخدم: ${safeSourceUrl}` : '',
+              '',
+              'تعليمات صارمة جدًا:',
+              '1. إذا لم تجد نصًا حقيقيًا وموثوقًا يخص هذا الدرس أو الصفحات المحددة في نتائج البحث أو الرابط المرفق (أو كان ملفًا/بوابة لا يمكن قراءتها)، فاكتب في السطر الأول حرفيًا: LIBRARY_STATUS: NOT_FOUND ولا تخترع أو تخمن محتوى غير موجود.',
+              '2. فقط إذا وجدت محتوى فعليًا ومؤكدًا للدرس من المكتبة أو الكتاب المدرسي، اكتب في السطر الأول حرفيًا: LIBRARY_STATUS: FOUND ثم استخرج ملخصًا تعليميًا دقيقًا يتضمن عنوان الوحدة والدرس والمفاهيم والقوانين والأمثلة ونقاط التقويم الموجودة في المصدر.',
+            ]
+              .filter(Boolean)
+              .join('\n');
+
+            const groundingRes = await ai.models.generateContent({
+              model: 'gemini-4-hydrogen',
+              contents: searchPrompt,
+              config: {
+                tools: searchTools as never,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                abortSignal: AbortSignal.timeout(12000),
+              },
+            });
+
+            groundedLessonNotes = extractGeminiText(groundingRes).slice(0, 6500);
+
+            const metadata = groundingRes.candidates?.[0]?.groundingMetadata as
+              | { groundingChunks?: Array<{ web?: { uri?: string; title?: string } }> }
+              | undefined;
+            if (Array.isArray(metadata?.groundingChunks)) {
+              for (const chunk of metadata.groundingChunks) {
+                const rawUri = chunk.web?.uri?.trim();
+                if (!rawUri) continue;
+                const safeUri = isSafeExternalUrl(rawUri);
+                if (!safeUri || seenSourceUrls.has(safeUri)) continue;
+                seenSourceUrls.add(safeUri);
+                bookSources.push({
+                  title: sanitizeTextInput(chunk.web?.title || 'مصدر من المكتبة الإلكترونية', 140, false),
+                  url: safeUri,
+                });
+                if (bookSources.length >= 6) break;
+              }
+            }
+          } catch (groundingErr) {
+            console.warn('[Nova AI Exam Grounding fallback]:', groundingErr);
+          }
+
+          if (clientDisconnected) {
+            cleanupHeartbeat();
+            return;
+          }
+
+          const explicitNotFound = /^LIBRARY_STATUS:\s*NOT_FOUND/i.test(groundedLessonNotes);
+          const cleanedGroundedBody = groundedLessonNotes
+            .replace(/^LIBRARY_STATUS:\s*(FOUND|NOT_FOUND)\s*/i, '')
+            .trim();
+          const modelReportsFailure =
+            /^(تعذر|لم أتمكن|لا يمكن|غير متاح|لا يتوفر محتوى)/i.test(cleanedGroundedBody) &&
+            bookSources.length === 0 &&
+            directUrlText.length < 120;
+
+          const hasReadableSource =
+            directUrlText.length >= 120 ||
+            (!explicitNotFound &&
+              !modelReportsFailure &&
+              bookSources.length > 0 &&
+              cleanedGroundedBody.length >= 120);
+
+          if (!hasReadableSource) {
+            cleanupHeartbeat();
+            const unableMsg = safeSourceUrl && directUrlWasUnreadable
+              ? 'لم يتمكن النظام من قراءة محتوى الدرس من الرابط المرفق أو من المكتبة الإلكترونية (قد يكون الرابط ملف PDF محميًا أو يتطلب تسجيل دخول)، ولذلك لم نختلق أسئلة غير موثقة. يمكنك لصق نص الدرس في الحقل المخصص أدناه لإنشاء الاختبار بدقة.'
+              : 'لم يتمكن النظام من العثور على محتوى هذا الدرس أو الصفحات المحددة وقراءته فعليًا من المكتبة الإلكترونية، ولذلك تم إيقاف التوليد بدل اختلاق أسئلة غير دقيقة. يمكنك لصق نص الدرس أو إضافة رابط مباشر لصفحة الدرس والمحاولة مجددًا.';
+            if (isStreamingStarted) {
+              writeEvent({ type: 'error', error: unableMsg, code: 'LIBRARY_CONTENT_UNAVAILABLE' });
+              res.end();
+            } else {
+              res.status(422).json({ error: unableMsg, code: 'LIBRARY_CONTENT_UNAVAILABLE' });
+            }
+            return;
+          }
+
+          groundedLessonNotes = [directUrlText, cleanedGroundedBody].filter(Boolean).join('\n\n').slice(0, 6500);
+        } else {
+          groundedLessonNotes = cleanLessonContent;
         }
 
         if (safeSourceUrl && !seenSourceUrls.has(safeSourceUrl)) {
@@ -2341,7 +2651,7 @@ async function startServer() {
         // Step 2: Generate Strict Structured Multiple-Choice Exam (Exact targetCount & 4 fixed options per question)
         const examSystemInstruction = [
           'أنت خبير تربوي ومصمم اختبارات مدرسية معتمدة على المناهج الدراسية والمكتبة الإلكترونية في Nova AI.',
-          'مهمتك إعداد اختبار اختيار من متعدد دقيق وعلمي ومطابق تمامًا للمنهج والصف والدرس والصفحات المحددة.',
+          'مهمتك إعداد اختبار اختيار من متعدد دقيق وعلمي ومستند حصريًا إلى محتوى الدرس المسترجع أو النص المرفق أدناه.',
           'قواعد صارمة لا يجوز مخالفتها:',
           `1. أنشئ بالضبط ${targetCount} سؤالًا (questions.length = ${targetCount}) دون زيادة أو نقصان.`,
           '2. لكل سؤال أربعة خيارات ثابتة بالضبط (options.length = 4) مع فهرس الإجابة الصحيحة correctIndex بين 0 و 3.',
@@ -2357,9 +2667,7 @@ async function startServer() {
           `الدرس / أرقام الصفحات المطلوبة: ${cleanLessonOrPages}`,
           `مستوى الصعوبة المطلوب: ${difficultyLabel}`,
           `عدد الأسئلة المطلوب بالضبط: ${targetCount} سؤالًا`,
-          groundedLessonNotes
-            ? `\nمعلومات مسترجعة من البحث في المكتبة الإلكترونية والكتاب المدرسي:\n${groundedLessonNotes}`
-            : '\nاستند إلى معرفتك الدقيقة بالمنهج المدرسي المحدد والكتاب المعتمد لهذا الصف والدرس.',
+          `\nمحتوى الدرس الموثق الذي يجب الاعتماد عليه في صياغة الأسئلة:\n${groundedLessonNotes}`,
         ].join('\n');
 
         const attempts: Array<{ model: string; level: ThinkingLevel; timeoutMs: number }> = [
@@ -2535,15 +2843,491 @@ async function startServer() {
     }
   });
 
+  // 7. Lesson Summarization Endpoint (Text or Lesson Image -> Clear Arabic Bullet Points)
+  app.post('/api/nova/summarize-lesson', async (req: AuthedRequest, res: Response) => {
+    try {
+      const { lessonText = '', subject = '', image } = req.body as {
+        lessonText?: string;
+        subject?: string;
+        image?: { data?: string; mimeType?: string };
+      };
+
+      const cleanText = sanitizeTextInput(lessonText, 20000);
+      const cleanSubject = sanitizeTextInput(subject, 120, false);
+      const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+      const hasValidImage = Boolean(
+        image &&
+          typeof image.mimeType === 'string' &&
+          ALLOWED_IMAGE_MIMES.has(image.mimeType) &&
+          typeof image.data === 'string' &&
+          image.data.length > 0 &&
+          image.data.length <= 6_000_000 &&
+          /^[A-Za-z0-9+/=\s]+$/.test(image.data.slice(0, 200))
+      );
+
+      if (image && !hasValidImage) {
+        res.status(400).json({ error: 'صيغة صورة الدرس غير صالحة أو تتجاوز الحد المسموح.' });
+        return;
+      }
+
+      if (!hasValidImage && cleanText.length < 15) {
+        res.status(400).json({ error: 'يرجى كتابة نص الدرس (15 حرفًا على الأقل) أو إرفاق صورة للدرس.' });
+        return;
+      }
+
+      const ai = getAiClient();
+      const parts: ChatContentPart[] = [];
+      if (hasValidImage && image?.data && image?.mimeType) {
+        parts.push({ inlineData: { data: image.data, mimeType: image.mimeType } });
+      }
+      parts.push({
+        text: [
+          cleanSubject ? `المادة / الموضوع: ${cleanSubject}` : '',
+          cleanText
+            ? `نص الدرس المطلوب تلخيصه:\n${cleanText}`
+            : 'اقرأ محتوى الدرس الظاهر في الصورة بدقة عالية ثم لخّصه في نقاط عربية واضحة ومنظمة.',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+      });
+
+      const systemInstruction = [
+        'أنت خبير تربوي ومساعد تلخيص دراسي في منصة Nova AI.',
+        'لخّص الدرس المرفق (سواء كان نصًا أو صورة لصفحة كتاب/سبورة/ملخص) باللغة العربية الفصحى الواضحة.',
+        'قواعد مهمة:',
+        '1. التزم فقط بالمعلومات الواردة في الدرس دون اختلاق حقائق من خارج النص أو الصورة.',
+        '2. قدّم summaryTitle مختصرًا ومعبرًا، وoverview موجزة في جملتين، و5 إلى 10 نقاط رئيسية مرتبة وواضحة في bulletPoints.',
+        '3. استخرج أهم المصطلحات أو القوانين أو التواريخ في keyTerms (من 2 إلى 6 عناصر).',
+      ].join('\n');
+
+      const attempts: Array<{ model: string; level: ThinkingLevel; timeoutMs: number }> = [
+        { model: hasValidImage ? 'gemini-4-hydrogen' : 'gemini-3.1-flash-lite', level: hasValidImage ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL, timeoutMs: 25000 },
+        { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW, timeoutMs: 28000 },
+      ];
+
+      let lastError: unknown;
+      for (const attempt of attempts) {
+        try {
+          const response = await ai.models.generateContent({
+            model: attempt.model,
+            contents: [{ role: 'user', parts }],
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: attempt.level },
+              abortSignal: AbortSignal.timeout(attempt.timeoutMs),
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  subject: { type: Type.STRING },
+                  overview: { type: Type.STRING },
+                  bulletPoints: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                  },
+                  keyTerms: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        term: { type: Type.STRING },
+                        definition: { type: Type.STRING },
+                      },
+                      required: ['term', 'definition'],
+                    },
+                  },
+                },
+                required: ['title', 'subject', 'overview', 'bulletPoints', 'keyTerms'],
+              },
+            },
+          });
+
+          const rawText = extractGeminiText(response);
+          if (!rawText) {
+            lastError = new Error('EMPTY_SUMMARY_REPLY');
+            continue;
+          }
+          const parsed = JSON.parse(rawText) as {
+            title?: string;
+            subject?: string;
+            overview?: string;
+            bulletPoints?: unknown[];
+            keyTerms?: Array<{ term?: string; definition?: string }>;
+          };
+
+          const bullets = Array.isArray(parsed.bulletPoints)
+            ? parsed.bulletPoints.map((b) => String(b ?? '').trim()).filter(Boolean).slice(0, 12)
+            : [];
+          if (bullets.length === 0) {
+            lastError = new Error('EMPTY_SUMMARY_BULLETS');
+            continue;
+          }
+
+          const keyTerms = Array.isArray(parsed.keyTerms)
+            ? parsed.keyTerms
+                .map((kt) => ({
+                  term: String(kt?.term ?? '').trim(),
+                  definition: String(kt?.definition ?? '').trim(),
+                }))
+                .filter((kt) => kt.term && kt.definition)
+                .slice(0, 8)
+            : [];
+
+          res.json({
+            title: (parsed.title || cleanSubject || 'ملخص الدرس').trim().slice(0, 150),
+            subject: (parsed.subject || cleanSubject || 'مادة دراسية').trim().slice(0, 120),
+            overview: (parsed.overview || '').trim().slice(0, 1000),
+            bulletPoints: bullets,
+            keyTerms,
+            model: attempt.model,
+          });
+          return;
+        } catch (err) {
+          lastError = err;
+          if (!isRetryableError(err) && !(err instanceof SyntaxError)) {
+            throw err;
+          }
+        }
+      }
+
+      throw lastError ?? new Error('EMPTY_SUMMARY_REPLY');
+    } catch (err) {
+      console.error('[Nova AI Summarize Lesson Error]:', err);
+      const mapped = mapGeminiError(err);
+      res.status(mapped.status).json({ error: mapped.message, requiresPaidKey: mapped.requiresPaidKey });
+    }
+  });
+
+  // 8. Study Flashcards Generator Endpoint (Lesson Content/Image -> Interactive Q&A Cards)
+  app.post('/api/nova/generate-flashcards', async (req: AuthedRequest, res: Response) => {
+    try {
+      const { lessonText = '', subject = '', count = 8, image } = req.body as {
+        lessonText?: string;
+        subject?: string;
+        count?: number;
+        image?: { data?: string; mimeType?: string };
+      };
+
+      const cleanText = sanitizeTextInput(lessonText, 20000);
+      const cleanSubject = sanitizeTextInput(subject, 120, false);
+      const targetCards = Math.min(15, Math.max(4, Math.round(Number(count) || 8)));
+      const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+      const hasValidImage = Boolean(
+        image &&
+          typeof image.mimeType === 'string' &&
+          ALLOWED_IMAGE_MIMES.has(image.mimeType) &&
+          typeof image.data === 'string' &&
+          image.data.length > 0 &&
+          image.data.length <= 6_000_000 &&
+          /^[A-Za-z0-9+/=\s]+$/.test(image.data.slice(0, 200))
+      );
+
+      if (image && !hasValidImage) {
+        res.status(400).json({ error: 'صيغة صورة الدرس غير صالحة أو تتجاوز الحد المسموح.' });
+        return;
+      }
+
+      if (!hasValidImage && cleanText.length < 15) {
+        res.status(400).json({ error: 'يرجى إدخال نص الدرس (15 حرفًا على الأقل) أو إرفاق صورة للدرس لتوليد البطاقات.' });
+        return;
+      }
+
+      const ai = getAiClient();
+      const parts: ChatContentPart[] = [];
+      if (hasValidImage && image?.data && image?.mimeType) {
+        parts.push({ inlineData: { data: image.data, mimeType: image.mimeType } });
+      }
+      parts.push({
+        text: [
+          cleanSubject ? `المادة / العنوان: ${cleanSubject}` : '',
+          `أنشئ ${targetCards} بطاقة مراجعة (سؤال وجواب) للمذاكرة السريعة من محتوى الدرس التالي فقط:`,
+          cleanText || 'استخرج المحتوى الظاهر في الصورة وأنشئ بطاقات مراجعة دقيقة تغطي أهم النقاط.',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+      });
+
+      const systemInstruction = [
+        'أنت مصمم بطاقات استذكار سريعة (Flashcards) في منصة Nova AI.',
+        `أنشئ بالضبط ${targetCards} بطاقة سؤال وجواب مستخرجة مباشرة من محتوى الدرس المرفق.`,
+        'اجعل السؤال في بطاقة الواجهة (question) قصيرًا وواضحًا، والإجابة (answer) مركزة ودقيقة باللغة العربية، وأضف تلميحًا مختصرًا (hint) يساعد الطالب على التذكر.',
+      ].join('\n');
+
+      const attempts: Array<{ model: string; level: ThinkingLevel; timeoutMs: number }> = [
+        { model: hasValidImage ? 'gemini-4-hydrogen' : 'gemini-3.1-flash-lite', level: hasValidImage ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL, timeoutMs: 25000 },
+        { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW, timeoutMs: 28000 },
+      ];
+
+      let lastError: unknown;
+      for (const attempt of attempts) {
+        try {
+          const response = await ai.models.generateContent({
+            model: attempt.model,
+            contents: [{ role: 'user', parts }],
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: attempt.level },
+              abortSignal: AbortSignal.timeout(attempt.timeoutMs),
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  deckTitle: { type: Type.STRING },
+                  cards: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        question: { type: Type.STRING },
+                        answer: { type: Type.STRING },
+                        hint: { type: Type.STRING },
+                      },
+                      required: ['question', 'answer', 'hint'],
+                    },
+                  },
+                },
+                required: ['deckTitle', 'cards'],
+              },
+            },
+          });
+
+          const rawText = extractGeminiText(response);
+          if (!rawText) {
+            lastError = new Error('EMPTY_FLASHCARDS_REPLY');
+            continue;
+          }
+
+          const parsed = JSON.parse(rawText) as {
+            deckTitle?: string;
+            cards?: Array<{ question?: string; answer?: string; hint?: string }>;
+          };
+
+          const cards = Array.isArray(parsed.cards)
+            ? parsed.cards
+                .map((c) => ({
+                  question: String(c?.question ?? '').trim(),
+                  answer: String(c?.answer ?? '').trim(),
+                  hint: String(c?.hint ?? '').trim(),
+                }))
+                .filter((c) => c.question && c.answer)
+                .slice(0, targetCards)
+            : [];
+
+          if (cards.length === 0) {
+            lastError = new Error('EMPTY_FLASHCARDS_ARRAY');
+            continue;
+          }
+
+          res.json({
+            deckTitle: (parsed.deckTitle || cleanSubject || 'بطاقات مراجعة الدرس').trim().slice(0, 150),
+            cards,
+            model: attempt.model,
+          });
+          return;
+        } catch (err) {
+          lastError = err;
+          if (!isRetryableError(err) && !(err instanceof SyntaxError)) {
+            throw err;
+          }
+        }
+      }
+
+      throw lastError ?? new Error('EMPTY_FLASHCARDS_REPLY');
+    } catch (err) {
+      console.error('[Nova AI Flashcards Error]:', err);
+      const mapped = mapGeminiError(err);
+      res.status(mapped.status).json({ error: mapped.message, requiresPaidKey: mapped.requiresPaidKey });
+    }
+  });
+
+  // 9. Guided Homework Helper Endpoint (Step-by-Step Pedagogical Guidance WITHOUT Direct Final Answer)
+  app.post('/api/nova/homework-help', async (req: AuthedRequest, res: Response) => {
+    try {
+      const { question = '', subject = '', studentAttempt = '', image } = req.body as {
+        question?: string;
+        subject?: string;
+        studentAttempt?: string;
+        image?: { data?: string; mimeType?: string };
+      };
+
+      const cleanQuestion = sanitizeTextInput(question, 5000);
+      const cleanSubject = sanitizeTextInput(subject, 120, false);
+      const cleanAttempt = sanitizeTextInput(studentAttempt, 2500);
+
+      const ALLOWED_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+      const hasValidImage = Boolean(
+        image &&
+          typeof image.mimeType === 'string' &&
+          ALLOWED_IMAGE_MIMES.has(image.mimeType) &&
+          typeof image.data === 'string' &&
+          image.data.length > 0 &&
+          image.data.length <= 6_000_000 &&
+          /^[A-Za-z0-9+/=\s]+$/.test(image.data.slice(0, 200))
+      );
+
+      if (image && !hasValidImage) {
+        res.status(400).json({ error: 'صيغة صورة الواجب غير صالحة أو تتجاوز الحد المسموح.' });
+        return;
+      }
+
+      if (!hasValidImage && cleanQuestion.length < 4) {
+        res.status(400).json({ error: 'يرجى كتابة سؤال الواجب أو إرفاق صورته أولاً.' });
+        return;
+      }
+
+      const ai = getAiClient();
+      const parts: ChatContentPart[] = [];
+      if (hasValidImage && image?.data && image?.mimeType) {
+        parts.push({ inlineData: { data: image.data, mimeType: image.mimeType } });
+      }
+      parts.push({
+        text: [
+          cleanSubject ? `المادة: ${cleanSubject}` : '',
+          cleanQuestion ? `سؤال الواجب:\n${cleanQuestion}` : 'اقرأ سؤال الواجب الظاهر في الصورة بدقة واشرح طريقة حله خطوة بخطوة.',
+          cleanAttempt ? `محاولة الطالب أو إجابته المبدئية:\n${cleanAttempt}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+      });
+
+      const systemInstruction = [
+        'أنت معلّم ومساعد واجبات تربوي صبور في منصة Nova AI.',
+        'مهمتك مساعدة الطالب على فهم طريقة حل سؤال الواجب خطوة بخطوة باللغة العربية الفصحى الواضحة.',
+        'القاعدة الذهبية الصارمة (ممنوع مخالفتها):',
+        '- لا تُعطِ الإجابة النهائية الجاهزة أو الناتج الرقمي النهائي أو الكلمة/الاختيار النهائي الصحيح مباشرة!',
+        '- بدلًا من ذلك: اشرح القاعدة أو القانون أو المفهوم المستخدم، ثم فكّك الحل إلى خطوات مرقّمة واضحة توصل الطالب إلى عتبة الخطوة الأخيرة، واترك له استنتاج الناتج النهائي بنفسه.',
+        '- إذا كتب الطالب محاولة حل في studentAttempt، قيّم خطواته بلطف: اذكر ما أصاب فيه وحدد أين يحتاج للتصحيح دون كشف الحل النهائي مباشرة.',
+        '- استخدم رموزًا رياضية وعلمية واضحة (س، ص، ÷، ×، ²، √) دون تعقيد.',
+      ].join('\n');
+
+      const attempts: Array<{ model: string; level: ThinkingLevel; timeoutMs: number }> = [
+        { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW, timeoutMs: 26000 },
+        { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MEDIUM, timeoutMs: 26000 },
+      ];
+
+      let lastError: unknown;
+      for (const attempt of attempts) {
+        try {
+          const response = await ai.models.generateContent({
+            model: attempt.model,
+            contents: [{ role: 'user', parts }],
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: attempt.level },
+              abortSignal: AbortSignal.timeout(attempt.timeoutMs),
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  concept: { type: Type.STRING },
+                  steps: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                  },
+                  hint: { type: Type.STRING },
+                  nextCheckQuestion: { type: Type.STRING },
+                },
+                required: ['title', 'concept', 'steps', 'hint', 'nextCheckQuestion'],
+              },
+            },
+          });
+
+          const rawText = extractGeminiText(response);
+          if (!rawText) {
+            lastError = new Error('EMPTY_HOMEWORK_REPLY');
+            continue;
+          }
+
+          const parsed = JSON.parse(rawText) as {
+            title?: string;
+            concept?: string;
+            steps?: unknown[];
+            hint?: string;
+            nextCheckQuestion?: string;
+          };
+
+          const steps = Array.isArray(parsed.steps)
+            ? parsed.steps.map((s) => String(s ?? '').trim()).filter(Boolean).slice(0, 10)
+            : [];
+          if (steps.length === 0) {
+            lastError = new Error('EMPTY_HOMEWORK_STEPS');
+            continue;
+          }
+
+          res.json({
+            title: (parsed.title || cleanSubject || 'شرح خطوات الواجب').trim().slice(0, 150),
+            concept: (parsed.concept || '').trim().slice(0, 800),
+            steps,
+            hint: (parsed.hint || '').trim().slice(0, 800),
+            nextCheckQuestion: (parsed.nextCheckQuestion || '').trim().slice(0, 600),
+            model: attempt.model,
+          });
+          return;
+        } catch (err) {
+          lastError = err;
+          if (!isRetryableError(err) && !(err instanceof SyntaxError)) {
+            throw err;
+          }
+        }
+      }
+
+      throw lastError ?? new Error('EMPTY_HOMEWORK_REPLY');
+    } catch (err) {
+      console.error('[Nova AI Homework Helper Error]:', err);
+      const mapped = mapGeminiError(err);
+      res.status(mapped.status).json({ error: mapped.message, requiresPaidKey: mapped.requiresPaidKey });
+    }
+  });
+
   // Never let any unmatched /api/* request fall through to Vite/HTML
   app.all('/api/*', (_req, res) => {
     res.status(404).json({ error: 'مسار الخدمة المطلوب غير موجود على الخادم.' });
   });
 
+  // Global JSON parse / payload / unexpected error sanitizer for API & serverless runtime
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const errObj = err as { type?: string; status?: number };
+    if (errObj?.type === 'entity.too.large' || errObj?.status === 413) {
+      res.status(413).json({ error: 'حجم البيانات المرسلة أكبر من الحد المسموح.' });
+      return;
+    }
+    if (err instanceof SyntaxError || errObj?.type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'تنسيق البيانات المرسلة غير صالح.' });
+      return;
+    }
+    console.error('[Nova AI Unexpected Server Error]:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'حدث خطأ غير متوقع في الخادم.' });
+    }
+  });
+
+  return app;
+}
+
+async function startServer() {
+  const app = createNovaApiApp();
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
+    const isHmrDisabled = process.env.DISABLE_HMR === 'true';
+    const devAllowedHosts = ['.run.app', '.googleusercontent.com', 'localhost', '127.0.0.1'];
+    if (process.env.APP_URL) {
+      try {
+        devAllowedHosts.push(new URL(process.env.APP_URL).hostname);
+      } catch {
+        // ignore invalid APP_URL
+      }
+    }
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: devAllowedHosts,
+        hmr: isHmrDisabled ? false : true,
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -2589,7 +3373,6 @@ async function startServer() {
     }
   });
 
-  const httpServer = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
   httpServer.on('upgrade', (request: IncomingMessage, socket, head) => {
@@ -2688,6 +3471,16 @@ async function startServer() {
           }
         }
 
+        const quotaCheck = checkUserAiQuotas(uid, false);
+        if (!quotaCheck.allowed) {
+          recordSecurityEvent('rate_limit_block', clientIp, '/api/nova/live');
+          if (clientWs.readyState === clientWs.OPEN) {
+            clientWs.send(JSON.stringify({ error: quotaCheck.reason || 'تم تجاوز حد الطلبات مؤقتًا.' }));
+          }
+          closeAll();
+          return;
+        }
+
         const uidSockets = wsActiveByUid.get(uid) ?? 0;
         if (uidSockets >= 3) {
           if (clientWs.readyState === clientWs.OPEN) {
@@ -2701,14 +3494,15 @@ async function startServer() {
 
         const ai = getAiClient();
         const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-        const chosenVoice = allowedVoices.includes(voiceParam) ? voiceParam : 'Kore';
+        const chosenVoice = typeof voiceParam === 'string' && allowedVoices.includes(voiceParam) ? voiceParam : 'Kore';
+        const cleanInstruction = sanitizeTextInput(customInstruction, 600);
 
         const systemInstruction = [
           'أنت Nova AI في محادثة صوتية مباشرة بالوقت الفعلي.',
           'التزم بالتحدث باللغة العربية الفصحى الواضحة والسليمة فقط في جميع ردودك الصوتية، وبنطق عربي طبيعي ودافئ ومفهوم.',
           'لا تتحول إلى اللغة الإنجليزية أو أي لغة أخرى ولا تخلط كلمات أجنبية غير ضرورية ما لم يطلب المستخدم ذلك صراحةً.',
           'اجعل ردودك الصوتية مركزة ومفيدة ومباشرة دون إطالة مملة، وإذا سألك المستخدم سؤالاً فأعطه الإجابة الصحيحة بوضوح.',
-          customInstruction ? `تعليمات المستخدم الشخصية:\n${customInstruction.slice(0, 600)}` : '',
+          cleanInstruction ? `تعليمات المستخدم الشخصية:\n${cleanInstruction}` : '',
         ]
           .filter(Boolean)
           .join('\n');
@@ -2843,8 +3637,11 @@ async function startServer() {
           liveSession.sendRealtimeInput({
             video: { data: parsed.video, mimeType: 'image/jpeg' },
           });
-        } else if (parsed.text && typeof parsed.text === 'string' && parsed.text.length <= 4000) {
-          liveSession.sendRealtimeInput({ text: parsed.text });
+        } else if (parsed.text && typeof parsed.text === 'string') {
+          const cleanWsText = sanitizeTextInput(parsed.text, 4000);
+          if (cleanWsText) {
+            liveSession.sendRealtimeInput({ text: cleanWsText });
+          }
         }
       } catch {
         // ignore malformed client frame
@@ -2861,4 +3658,6 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  startServer();
+}

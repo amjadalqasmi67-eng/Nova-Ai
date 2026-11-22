@@ -88,7 +88,7 @@ service cloud.firestore {
 
     function isValidMessage(data, userId, conversationId) {
       return data.keys().hasAll(['userId', 'conversationId', 'role', 'content', 'hasAttachment', 'createdAt'])
-        && data.keys().hasOnly(['userId', 'conversationId', 'role', 'content', 'hasAttachment', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'conversationId', 'role', 'content', 'hasAttachment', 'createdAt', 'rating'])
         && data.userId is string
         && data.userId == userId
         && data.userId == request.auth.uid
@@ -101,6 +101,42 @@ service cloud.firestore {
         && data.content.size() >= 1
         && data.content.size() <= 20000
         && data.hasAttachment is bool
+        && (!('rating' in data) || (data.rating in ['none', 'like', 'dislike']))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStudyHistoryItem(data, userId) {
+      return data.keys().hasAll(['userId', 'type', 'title', 'content', 'createdAt'])
+        && data.keys().hasOnly(['userId', 'type', 'title', 'subject', 'inputPreview', 'content', 'itemCount', 'createdAt'])
+        && data.userId is string
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && isValidId(data.userId)
+        && data.type in ['summary', 'flashcards', 'homework', 'exam']
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 160
+        && (!('subject' in data) || (data.subject is string && data.subject.size() <= 160))
+        && (!('inputPreview' in data) || (data.inputPreview is string && data.inputPreview.size() <= 500))
+        && data.content is string
+        && data.content.size() >= 1
+        && data.content.size() <= 15000
+        && (!('itemCount' in data) || (data.itemCount is int && data.itemCount >= 0 && data.itemCount <= 100))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidSharedSnippet(data) {
+      return data.keys().hasAll(['ownerUid', 'question', 'answer', 'createdAt'])
+        && data.keys().hasOnly(['ownerUid', 'question', 'answer', 'createdAt'])
+        && data.ownerUid is string
+        && isValidId(data.ownerUid)
+        && data.ownerUid == request.auth.uid
+        && data.question is string
+        && data.question.size() >= 1
+        && data.question.size() <= 5000
+        && data.answer is string
+        && data.answer.size() >= 1
+        && data.answer.size() <= 20000
         && data.createdAt is timestamp;
     }
 
@@ -199,9 +235,33 @@ service cloud.firestore {
             && incoming().createdAt == request.time
             && exists(/databases/$(database)/documents/users/$(userId)/conversations/$(conversationId))
             && get(/databases/$(database)/documents/users/$(userId)/conversations/$(conversationId)).data.userId == request.auth.uid;
-          allow update: if false;
+          allow update: if isValidId(userId)
+            && isValidId(conversationId)
+            && isValidId(messageId)
+            && isOwner(userId)
+            && isValidMessage(incoming(), userId, conversationId)
+            && existing().role == 'assistant'
+            && incoming().userId == existing().userId
+            && incoming().conversationId == existing().conversationId
+            && incoming().role == existing().role
+            && incoming().content == existing().content
+            && incoming().hasAttachment == existing().hasAttachment
+            && incoming().createdAt == existing().createdAt
+            && incoming().diff(existing()).affectedKeys().hasOnly(['rating']);
           allow delete: if isValidId(userId) && isValidId(conversationId) && isValidId(messageId) && isOwner(userId);
         }
+      }
+
+      match /studyHistory/{recordId} {
+        allow get: if isValidId(userId) && isValidId(recordId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.userId == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(recordId)
+          && isOwner(userId)
+          && isValidStudyHistoryItem(incoming(), userId)
+          && incoming().createdAt == request.time;
+        allow update: if false;
+        allow delete: if isValidId(userId) && isValidId(recordId) && isOwner(userId);
       }
     }
 
@@ -248,6 +308,18 @@ service cloud.firestore {
           )
         );
       allow delete: if isValidId(messageId) && (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+    }
+
+    match /sharedSnippets/{shareId} {
+      allow get: if isValidId(shareId) && shareId.size() >= 20;
+      allow list: if false;
+      allow create: if isValidId(shareId)
+        && shareId.size() >= 20
+        && isSignedIn()
+        && isValidSharedSnippet(incoming())
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(shareId) && isSignedIn() && existing().ownerUid == request.auth.uid;
     }
 
     match /visitLogs/{visitId} {

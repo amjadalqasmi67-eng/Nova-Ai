@@ -15,9 +15,12 @@ import {
   EyeOff,
   FileText,
   SlidersHorizontal,
+  RefreshCw,
 } from 'lucide-react';
 import { getOtpHeaders } from '../lib/otpSession';
 import { postNdjsonOrJson } from '../lib/ndjsonFetch';
+import { safeHttpUrl, sanitizeUserText } from '../lib/sanitize';
+import { saveStudyHistoryEntry } from '../lib/studyHistory';
 
 interface ExamStudioProps {
   user: User;
@@ -97,6 +100,7 @@ export function ExamStudio({ user }: ExamStudioProps) {
   const [curriculum, setCurriculum] = useState(CURRICULUM_OPTIONS[0]);
   const [subjectGrade, setSubjectGrade] = useState('');
   const [lessonOrPages, setLessonOrPages] = useState('');
+  const [lessonContent, setLessonContent] = useState('');
   const [questionCount, setQuestionCount] = useState(5);
   const [difficulty, setDifficulty] = useState<'mixed' | 'easy' | 'medium' | 'hard'>('mixed');
   const [sourceUrl, setSourceUrl] = useState('');
@@ -111,14 +115,19 @@ export function ExamStudio({ user }: ExamStudioProps) {
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [includeAnswerKey, setIncludeAnswerKey] = useState(true);
 
-  const handleGenerate = async (e: FormEvent) => {
-    e.preventDefault();
-    const cleanSubject = subjectGrade.trim();
-    const cleanLesson = lessonOrPages.trim();
+  const triggerGenerate = async () => {
+    const cleanSubject = sanitizeUserText(subjectGrade, 180, false);
+    const cleanLesson = sanitizeUserText(lessonOrPages, 800);
+    const cleanLessonContent = sanitizeUserText(lessonContent, 8000);
+    const cleanSource = sourceUrl.trim() ? safeHttpUrl(sourceUrl) : '';
     if (!cleanSubject || !cleanLesson || generating) return;
+    if (sourceUrl.trim() && !cleanSource) {
+      setError('رابط صفحة الكتاب غير صالح. يجب أن يبدأ بـ https:// أو http://.');
+      return;
+    }
 
     setGenerating(true);
-    setStatusText('جاري البحث في المكتبة الإلكترونية والكتاب المدرسي...');
+    setStatusText('جاري التحقق من محتوى الدرس في المكتبة الإلكترونية...');
     setError(null);
 
     try {
@@ -132,9 +141,10 @@ export function ExamStudio({ user }: ExamStudioProps) {
           curriculum,
           subjectGrade: cleanSubject,
           lessonOrPages: cleanLesson,
+          lessonContent: cleanLessonContent,
           questionCount,
           difficulty,
-          sourceUrl: sourceUrl.trim(),
+          sourceUrl: cleanSource || '',
         },
         onStatus: (msg) => setStatusText(msg),
       });
@@ -147,12 +157,38 @@ export function ExamStudio({ user }: ExamStudioProps) {
       setSelectedAnswers({});
       setIsSubmitted(false);
       setViewMode('interactive');
+
+      const formattedExam = [
+        data.lessonSummary ? `${data.lessonSummary}\n` : '',
+        '### أسئلة الاختبار:',
+        ...data.questions.map(
+          (q, idx) =>
+            `${idx + 1}. **${q.question}**\n- الإجابة الصحيحة: ${q.options[q.correctIndex] || q.options[0]}`
+        ),
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      saveStudyHistoryEntry({
+        userId: user.uid,
+        type: 'exam',
+        title: data.examTitle,
+        subject: data.subjectGrade,
+        inputPreview: cleanLesson.slice(0, 180),
+        content: formattedExam,
+        itemCount: data.questions.length,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'حدث خطأ أثناء الاتصال بخادم المناهج.');
     } finally {
       setGenerating(false);
       setStatusText('');
     }
+  };
+
+  const handleGenerate = async (e: FormEvent) => {
+    e.preventDefault();
+    await triggerGenerate();
   };
 
   const handleSelectOption = (qIdx: number, optIdx: number) => {
@@ -217,6 +253,9 @@ export function ExamStudio({ user }: ExamStudioProps) {
   </div>
   <div class="summary">${escapeHtml(exam.lessonSummary)}</div>
   ${questionsHtml}
+  <p style="margin-top:20px;padding:12px 14px;border:1px solid #f59e0b;border-radius:10px;background:#fffbeb;color:#92400e;font-size:13px;font-weight:700;">
+    راجع الإجابات قبل استخدامها، فقد يخطئ الذكاء الاصطناعي.
+  </p>
 </body>
 </html>`;
 
@@ -445,10 +484,39 @@ export function ExamStudio({ user }: ExamStudioProps) {
             </div>
           </div>
 
+          <div>
+            <label htmlFor="exam-lesson-content" className="block text-xs font-bold text-slate-900 dark:text-white mb-1.5">
+              نص الدرس أو ملخصه (اختياري)
+            </label>
+            <textarea
+              id="exam-lesson-content"
+              rows={3}
+              maxLength={8000}
+              value={lessonContent}
+              onChange={(e) => setLessonContent(e.target.value)}
+              placeholder="الصق هنا نص الدرس أو النقاط الأساسية إذا تعذرت قراءة الكتاب تلقائيًا من المكتبة أو كان بصيغة PDF..."
+              className="accent-focus w-full rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/15 px-3.5 py-2.5 text-xs sm:text-sm text-slate-900 dark:text-white focus:outline-none resize-y"
+            />
+          </div>
+
           {error && (
-            <div className="flex items-start gap-2 rounded-xl bg-rose-500/10 border border-rose-500/30 p-3 text-xs text-rose-700 dark:text-rose-200">
-              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-              <span>{error}</span>
+            <div
+              role="alert"
+              className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 p-3 text-xs text-rose-700 dark:text-rose-200 leading-relaxed"
+            >
+              <div className="flex items-start gap-2 min-w-0">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
+                <span>{error}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => triggerGenerate()}
+                disabled={generating}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>إعادة المحاولة</span>
+              </button>
             </div>
           )}
 
@@ -539,18 +607,22 @@ export function ExamStudio({ user }: ExamStudioProps) {
                       مراجع المكتبة الإلكترونية والكتاب المدرسي:
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      {exam.bookSources.map((src) => (
-                        <a
-                          key={src.url}
-                          href={src.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs text-slate-700 dark:text-slate-200 transition-colors"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--accent-primary)' }} />
-                          <span className="truncate max-w-[210px]">{src.title}</span>
-                        </a>
-                      ))}
+                      {exam.bookSources.map((src) => {
+                        const safeHref = safeHttpUrl(src.url);
+                        if (!safeHref) return null;
+                        return (
+                          <a
+                            key={safeHref}
+                            href={safeHref}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs text-slate-700 dark:text-slate-200 transition-colors"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--accent-primary)' }} />
+                            <span className="truncate max-w-[210px]">{src.title}</span>
+                          </a>
+                        );
+                      })}
                     </div>
                   </div>
                 )}
@@ -735,6 +807,15 @@ export function ExamStudio({ user }: ExamStudioProps) {
                     </article>
                   );
                 })}
+
+                {/* Fixed AI Accuracy Disclaimer Directly Underneath Exam Questions */}
+                <div
+                  role="note"
+                  className="rounded-xl bg-amber-500/10 border border-amber-500/35 px-4 py-3 text-xs sm:text-sm font-semibold text-amber-800 dark:text-amber-200 flex items-center gap-2.5"
+                >
+                  <AlertCircle className="w-4 h-4 text-amber-500 shrink-0" />
+                  <span>راجع الإجابات قبل استخدامها، فقد يخطئ الذكاء الاصطناعي.</span>
+                </div>
               </div>
             </div>
           )}

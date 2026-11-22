@@ -16,6 +16,13 @@ import {
   Brain,
   Zap,
   AlertCircle,
+  RefreshCw,
+  ThumbsUp,
+  ThumbsDown,
+  Share2,
+  Check,
+  Copy,
+  Headphones,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import {
@@ -37,6 +44,7 @@ import { NovaStarLogo } from './NovaStarLogo';
 import { CameraCaptureModal } from './CameraCaptureModal';
 import { LiveVoiceModal } from './LiveVoiceModal';
 import { getOtpHeaders } from '../lib/otpSession';
+import { sanitizeUserText } from '../lib/sanitize';
 
 interface Conversation {
   id: string;
@@ -54,11 +62,13 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   hasAttachment: boolean;
+  rating?: 'none' | 'like' | 'dislike';
   createdAtMs: number;
 }
 
 interface ChatWorkspaceProps {
   user: User;
+  displayName?: string;
   userAvatarUrl?: string | null;
   customInstruction: string;
   draftPrompt?: string | null;
@@ -87,6 +97,7 @@ const STARTER_PROMPTS = [
 
 export function ChatWorkspace({
   user,
+  displayName,
   userAvatarUrl,
   customInstruction,
   draftPrompt,
@@ -104,11 +115,15 @@ export function ChatWorkspace({
   const [streamPhase, setStreamPhase] = useState<'generating' | 'thinking' | 'retrying'>('generating');
   const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [hasRetryAction, setHasRetryAction] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [cameraModalOpen, setCameraModalOpen] = useState(false);
   const [voiceModalOpen, setVoiceModalOpen] = useState(false);
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
   const [loadingTtsId, setLoadingTtsId] = useState<string | null>(null);
+  const [autoVoiceRead, setAutoVoiceRead] = useState(false);
+  const [sharingMsgId, setSharingMsgId] = useState<string | null>(null);
+  const [shareModal, setShareModal] = useState<{ url: string; question: string; copied: boolean } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -116,6 +131,13 @@ export function ChatWorkspace({
   const activeConversationIdRef = useRef<string | null>(null);
   const firestoreQueueRef = useRef<Promise<void>>(Promise.resolve());
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const autoVoiceReadRef = useRef(false);
+  autoVoiceReadRef.current = autoVoiceRead;
+  const lastFailedActionRef = useRef<
+    | { type: 'send'; text: string; attachment?: CompressedImage; convId: string; userMsgId: string }
+    | { type: 'tts'; msgId: string; content: string }
+    | null
+  >(null);
 
   useEffect(() => {
     if (draftPrompt) {
@@ -182,6 +204,10 @@ export function ChatWorkspace({
             role: data.role === 'assistant' ? 'assistant' : 'user',
             content: String(data.content || ''),
             hasAttachment: Boolean(data.hasAttachment),
+            rating:
+              data.rating === 'like' || data.rating === 'dislike'
+                ? data.rating
+                : ('none' as const),
             createdAtMs: created,
           };
         });
@@ -314,6 +340,8 @@ export function ChatWorkspace({
       await audio.play();
     } catch (err) {
       if (!speakWithBrowserFallback()) {
+        lastFailedActionRef.current = { type: 'tts', msgId, content };
+        setHasRetryAction(true);
         setError(err instanceof Error ? err.message : 'تعذر قراءة الرد صوتيًا.');
       }
     } finally {
@@ -391,6 +419,68 @@ export function ChatWorkspace({
     setError(null);
   };
 
+  const handleRateMessage = (msg: ChatMessage, choice: 'like' | 'dislike') => {
+    if (msg.role !== 'assistant' || !msg.conversationId) return;
+    const nextRating: 'none' | 'like' | 'dislike' = msg.rating === choice ? 'none' : choice;
+
+    setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, rating: nextRating } : m)));
+    setPendingMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, rating: nextRating } : m)));
+
+    const msgPath = `users/${user.uid}/conversations/${msg.conversationId}/messages/${msg.id}`;
+    firestoreQueueRef.current = firestoreQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        await updateDoc(doc(db, msgPath), { rating: nextRating });
+      })
+      .catch((err) => {
+        console.error('Failed to persist rating:', err);
+        setError('تعذر حفظ التقييم حاليًا. يرجى المحاولة مجددًا.');
+      });
+  };
+
+  const handleShareQa = async (assistantMsg: ChatMessage, msgIdx: number) => {
+    if (sharingMsgId) return;
+    setSharingMsgId(assistantMsg.id);
+    setError(null);
+
+    let pairedQuestion = '';
+    for (let i = msgIdx - 1; i >= 0; i--) {
+      const candidate = displayedMessages[i];
+      if (candidate && candidate.role === 'user' && candidate.content.trim()) {
+        pairedQuestion = candidate.content.trim();
+        break;
+      }
+    }
+    if (!pairedQuestion) {
+      pairedQuestion = 'سؤال مشارَك من محادثة Nova AI';
+    }
+
+    const shareId = crypto.randomUUID();
+    const sharePath = `sharedSnippets/${shareId}`;
+    try {
+      await setDoc(doc(db, sharePath), {
+        ownerUid: user.uid,
+        question: pairedQuestion.slice(0, 5000),
+        answer: assistantMsg.content.slice(0, 20000),
+        createdAt: serverTimestamp(),
+      });
+      const shareUrl = `${window.location.origin}/?share=${shareId}`;
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+      setShareModal({ url: shareUrl, question: pairedQuestion.slice(0, 140), copied });
+    } catch (err) {
+      console.error('Share Q&A error:', err);
+      setError('تعذر إنشاء رابط المشاركة حاليًا. يرجى المحاولة مرة أخرى.');
+    } finally {
+      setSharingMsgId(null);
+    }
+  };
+
   const handleDeleteConversation = async (convId: string) => {
     const path = `users/${user.uid}/conversations/${convId}`;
     try {
@@ -403,32 +493,38 @@ export function ChatWorkspace({
     }
   };
 
-  const sendMessage = async (promptText?: string, overrideAttachment?: CompressedImage) => {
+  const sendMessage = async (
+    promptText?: string,
+    overrideAttachment?: CompressedImage,
+    retryTarget?: { convId: string; userMsgId: string }
+  ) => {
     if (isLoadingReply) return;
-    const currentAttachment = overrideAttachment ?? attachment;
-    const rawText = (promptText ?? input).trim();
+    const currentAttachment = overrideAttachment ?? (retryTarget ? undefined : attachment);
+    const rawText = sanitizeUserText(promptText ?? input, 20000);
     const text = rawText || (currentAttachment ? 'حلّل هذه الصورة بالتفصيل واشرح ما يظهر فيها بدقة.' : '');
     if (!text) return;
 
+    lastFailedActionRef.current = null;
+    setHasRetryAction(false);
     setError(null);
-    if (!promptText && !overrideAttachment) {
+    if (!promptText && !overrideAttachment && !retryTarget) {
       setInput('');
     }
-    if (!overrideAttachment) {
+    if (!overrideAttachment && !retryTarget) {
       setAttachment(null);
     }
     setIsLoadingReply(true);
     setStreamingReply('');
     setStreamPhase(thinkingDepth === 'high' || currentAttachment ? 'thinking' : 'generating');
 
-    const existingConvId = activeConversationIdRef.current;
+    const existingConvId = retryTarget?.convId || activeConversationIdRef.current;
     const isNewConversation = !existingConvId;
     const convId = existingConvId || crypto.randomUUID();
     if (isNewConversation) {
       activeConversationIdRef.current = convId;
     }
 
-    const userMsgId = crypto.randomUUID();
+    const userMsgId = retryTarget?.userMsgId || crypto.randomUUID();
     const userMsgContent = text.slice(0, 20000);
 
     const combinedPrior = [
@@ -446,52 +542,56 @@ export function ChatWorkspace({
         content: m.content.slice(0, 2500),
       }));
 
-    setPendingMessages((prev) => [
-      ...prev,
-      {
-        id: userMsgId,
-        userId: user.uid,
-        conversationId: convId,
-        role: 'user',
-        content: userMsgContent,
-        hasAttachment: Boolean(currentAttachment),
-        createdAtMs: Date.now(),
-      },
-    ]);
-
-    // Queue Firestore writes sequentially in the background so parent doc always precedes child messages
-    const userPersistPromise = firestoreQueueRef.current
-      .catch(() => undefined)
-      .then(async () => {
-        const convPath = `users/${user.uid}/conversations/${convId}`;
-        if (isNewConversation) {
-          await setDoc(doc(db, convPath), {
-            userId: user.uid,
-            title: text.slice(0, 60),
-            lastMessagePreview: text.slice(0, 120),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-          if (activeConversationIdRef.current === convId) {
-            setActiveConversationId(convId);
-          }
-        } else {
-          await updateDoc(doc(db, convPath), {
-            lastMessagePreview: text.slice(0, 120),
-            updatedAt: serverTimestamp(),
-          });
-        }
-
-        const userMsgPath = `users/${user.uid}/conversations/${convId}/messages/${userMsgId}`;
-        await setDoc(doc(db, userMsgPath), {
+    if (!retryTarget) {
+      setPendingMessages((prev) => [
+        ...prev,
+        {
+          id: userMsgId,
           userId: user.uid,
           conversationId: convId,
           role: 'user',
           content: userMsgContent,
           hasAttachment: Boolean(currentAttachment),
-          createdAt: serverTimestamp(),
-        });
-      });
+          createdAtMs: Date.now(),
+        },
+      ]);
+    }
+
+    // Queue Firestore writes sequentially in the background so parent doc always precedes child messages
+    const userPersistPromise = retryTarget
+      ? firestoreQueueRef.current.catch(() => undefined)
+      : firestoreQueueRef.current
+          .catch(() => undefined)
+          .then(async () => {
+            const convPath = `users/${user.uid}/conversations/${convId}`;
+            if (isNewConversation) {
+              await setDoc(doc(db, convPath), {
+                userId: user.uid,
+                title: text.slice(0, 60),
+                lastMessagePreview: text.slice(0, 120),
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
+              if (activeConversationIdRef.current === convId) {
+                setActiveConversationId(convId);
+              }
+            } else {
+              await updateDoc(doc(db, convPath), {
+                lastMessagePreview: text.slice(0, 120),
+                updatedAt: serverTimestamp(),
+              });
+            }
+
+            const userMsgPath = `users/${user.uid}/conversations/${convId}/messages/${userMsgId}`;
+            await setDoc(doc(db, userMsgPath), {
+              userId: user.uid,
+              conversationId: convId,
+              role: 'user',
+              content: userMsgContent,
+              hasAttachment: Boolean(currentAttachment),
+              createdAt: serverTimestamp(),
+            });
+          });
 
     firestoreQueueRef.current = userPersistPromise;
 
@@ -535,6 +635,10 @@ export function ChatWorkspace({
         });
 
       firestoreQueueRef.current = assistantPersistPromise;
+
+      if (autoVoiceReadRef.current) {
+        handleToggleTts(assistantMsgId, assistantContent).catch(() => undefined);
+      }
     };
 
     const controller = new AbortController();
@@ -681,6 +785,14 @@ export function ChatWorkspace({
       persistAssistantInBackground(replyText);
     } catch (err) {
       await userPersistPromise.catch(() => undefined);
+      lastFailedActionRef.current = {
+        type: 'send',
+        text,
+        attachment: currentAttachment ?? undefined,
+        convId,
+        userMsgId,
+      };
+      setHasRetryAction(true);
       const errMsg = err instanceof Error ? err.message : '';
       if (
         (err instanceof DOMException && err.name === 'AbortError') ||
@@ -699,12 +811,28 @@ export function ChatWorkspace({
     }
   };
 
+  const handleRetryFailed = () => {
+    const failed = lastFailedActionRef.current;
+    if (!failed) return;
+    if (failed.type === 'send') {
+      sendMessage(failed.text, failed.attachment, {
+        convId: failed.convId,
+        userMsgId: failed.userMsgId,
+      });
+    } else if (failed.type === 'tts') {
+      lastFailedActionRef.current = null;
+      setHasRetryAction(false);
+      setError(null);
+      handleToggleTts(failed.msgId, failed.content);
+    }
+  };
+
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     sendMessage();
   };
 
-  const firstName = user.displayName?.split(' ')[0] || 'بك';
+  const firstName = (displayName || user.displayName || '').trim().split(/\s+/)[0] || 'بك';
 
   const currentTargetConvId = activeConversationIdRef.current;
   const displayedMessages = [
@@ -860,7 +988,7 @@ export function ChatWorkspace({
           </div>
 
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               <button
                 type="button"
                 onClick={() => setVoiceModalOpen(true)}
@@ -868,6 +996,20 @@ export function ChatWorkspace({
               >
                 <Mic className="w-3.5 h-3.5" />
                 <span>محادثة صوتية</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setAutoVoiceRead((v) => !v)}
+                aria-pressed={autoVoiceRead}
+                title="تشغيل أو إيقاف القراءة الصوتية التلقائية لردود المساعد"
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-semibold cursor-pointer whitespace-nowrap transition-colors ${
+                  autoVoiceRead
+                    ? 'accent-active-tab text-slate-900 dark:text-white'
+                    : 'bg-slate-100 dark:bg-[#050814] border-slate-200 dark:border-white/10 text-slate-700 dark:text-slate-300 hover:border-slate-300 dark:hover:border-white/25'
+                }`}
+              >
+                <Headphones className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
+                <span>{autoVoiceRead ? 'القراءة الصوتية: مفعّلة' : 'وضع القراءة الصوتية'}</span>
               </button>
               {onOpenPresentation && (
                 <button
@@ -945,7 +1087,7 @@ export function ChatWorkspace({
             </div>
           ) : (
             <div className="max-w-3xl mx-auto space-y-6">
-              {displayedMessages.map((msg) => (
+              {displayedMessages.map((msg, msgIdx) => (
                 <div key={msg.id} className="flex gap-2.5 sm:gap-3.5 justify-start">
                   {msg.role === 'assistant' ? (
                     <div className="mt-1 shrink-0">
@@ -985,12 +1127,12 @@ export function ChatWorkspace({
                       </div>
 
                       {msg.role === 'assistant' && (
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1">
                           <button
                             type="button"
                             onClick={() => handleToggleTts(msg.id, msg.content)}
                             disabled={loadingTtsId === msg.id}
-                            aria-label={speakingMsgId === msg.id ? 'إيقاف الصوت' : 'استماع للرد'}
+                            aria-label={speakingMsgId === msg.id ? 'إيقاف القراءة الصوتية' : 'قراءة الرد بصوت عالٍ'}
                             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-white/10 text-[11px] font-medium cursor-pointer transition-colors"
                           >
                             {speakingMsgId === msg.id ? (
@@ -1001,7 +1143,7 @@ export function ChatWorkspace({
                             ) : (
                               <>
                                 <Volume2 className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
-                                <span>{loadingTtsId === msg.id ? 'جاري التحميل...' : 'استماع'}</span>
+                                <span>{loadingTtsId === msg.id ? 'جاري التحميل...' : 'قراءة صوتية'}</span>
                               </>
                             )}
                           </button>
@@ -1025,6 +1167,51 @@ export function ChatWorkspace({
                         <p className="text-sm sm:text-[15px] leading-[1.75] whitespace-pre-wrap break-words">{msg.content}</p>
                       )}
                     </div>
+
+                    {msg.role === 'assistant' && (
+                      <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleRateMessage(msg, 'like')}
+                            aria-pressed={msg.rating === 'like'}
+                            aria-label="إعجاب بالرد"
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-medium cursor-pointer transition-colors ${
+                              msg.rating === 'like'
+                                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-700 dark:text-emerald-300 font-semibold'
+                                : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/10'
+                            }`}
+                          >
+                            <ThumbsUp className="w-3.5 h-3.5" />
+                            <span>إعجاب</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRateMessage(msg, 'dislike')}
+                            aria-pressed={msg.rating === 'dislike'}
+                            aria-label="عدم إعجاب بالرد"
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-medium cursor-pointer transition-colors ${
+                              msg.rating === 'dislike'
+                                ? 'bg-rose-500/15 border-rose-500/40 text-rose-700 dark:text-rose-300 font-semibold'
+                                : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/10'
+                            }`}
+                          >
+                            <ThumbsDown className="w-3.5 h-3.5" />
+                            <span>عدم إعجاب</span>
+                          </button>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleShareQa(msg, msgIdx)}
+                          disabled={sharingMsgId === msg.id}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-50 dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-[11px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer transition-colors disabled:opacity-50"
+                        >
+                          <Share2 className="w-3.5 h-3.5" style={{ color: 'var(--accent-primary)' }} />
+                          <span>{sharingMsgId === msg.id ? 'جاري التجهيز...' : 'مشاركة السؤال والجواب'}</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1066,22 +1253,41 @@ export function ChatWorkspace({
         </div>
 
         {/* Clear, Visible Error Alert */}
+        {/* Clear, Visible Error Alert with Retry */}
         {error && (
           <div
             role="alert"
-            className="mx-5 mb-3 rounded-xl bg-rose-500/10 border border-rose-500/35 px-4 py-3 text-xs sm:text-sm text-rose-700 dark:text-rose-200 flex items-start justify-between gap-3"
+            className="mx-3.5 sm:mx-5 mb-3 rounded-xl bg-rose-500/10 border border-rose-500/35 px-4 py-3 text-xs sm:text-sm text-rose-700 dark:text-rose-200 flex flex-wrap items-center justify-between gap-3"
           >
-            <div className="flex items-start gap-2.5 leading-relaxed">
+            <div className="flex items-start gap-2.5 leading-relaxed min-w-0">
               <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>
-            <button
-              type="button"
-              onClick={() => setError(null)}
-              className="text-rose-500 hover:text-rose-700 dark:hover:text-white shrink-0 cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {hasRetryAction && (
+                <button
+                  type="button"
+                  onClick={handleRetryFailed}
+                  disabled={isLoadingReply}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>إعادة المحاولة</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  lastFailedActionRef.current = null;
+                  setHasRetryAction(false);
+                  setError(null);
+                }}
+                aria-label="إغلاق التنبيه"
+                className="p-1 text-rose-500 hover:text-rose-700 dark:hover:text-white shrink-0 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         )}
 
@@ -1196,6 +1402,70 @@ export function ChatWorkspace({
           onClose={() => setVoiceModalOpen(false)}
           onAppendTurns={handleAppendVoiceTurns}
         />
+      )}
+
+      {shareModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-[#0B1020] border border-slate-200 dark:border-white/15 p-5 sm:p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-base font-bold text-slate-900 dark:text-white">
+                <Share2 className="w-5 h-5" style={{ color: 'var(--accent-primary)' }} />
+                <span>رابط مشاركة السؤال والجواب</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShareModal(null)}
+                aria-label="إغلاق"
+                className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+              هذا الرابط يتيح لمن تشاركه معه قراءة هذا السؤال وهذه الإجابة فقط، دون كشف بريدك الإلكتروني أو بقية محادثاتك وحسابك.
+            </p>
+
+            <div className="rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/10 p-3 text-xs text-slate-700 dark:text-slate-300 line-clamp-2">
+              {shareModal.question}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                readOnly
+                dir="ltr"
+                value={shareModal.url}
+                onFocus={(e) => e.currentTarget.select()}
+                className="flex-1 min-w-0 rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/15 px-3 py-2 text-xs font-mono text-slate-800 dark:text-slate-200"
+              />
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(shareModal.url);
+                    setShareModal((prev) => (prev ? { ...prev, copied: true } : prev));
+                  } catch {
+                    // user can copy directly from selected input
+                  }
+                }}
+                className="accent-btn inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-white text-xs font-semibold cursor-pointer shrink-0"
+              >
+                {shareModal.copied ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>تم النسخ</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>نسخ</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

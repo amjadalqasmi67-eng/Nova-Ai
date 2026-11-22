@@ -3,16 +3,20 @@ import { User } from 'firebase/auth';
 import {
   Presentation,
   Download,
+  FileDown,
   Sparkles,
   FileSliders,
   AlertCircle,
   CheckCircle2,
   Layers,
   StickyNote,
+  RefreshCw,
 } from 'lucide-react';
 import { PptxDeck, PptxVisualTheme, exportDeckToPptx } from '../lib/pptxBuilder';
+import { exportDeckToPdf } from '../lib/pdfExport';
 import { getOtpHeaders } from '../lib/otpSession';
 import { postNdjsonOrJson } from '../lib/ndjsonFetch';
+import { sanitizeUserText } from '../lib/sanitize';
 
 interface PresentationStudioProps {
   user: User;
@@ -42,6 +46,7 @@ export function PresentationStudio({
   const [generating, setGenerating] = useState(false);
   const [statusText, setStatusText] = useState('');
   const [downloading, setDownloading] = useState(false);
+  const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [deck, setDeck] = useState<PptxDeck | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -53,50 +58,113 @@ export function PresentationStudio({
     }
   }, [initialTopic, onConsumeInitialTopic]);
 
-  const handleGenerate = async (e: FormEvent) => {
-    e.preventDefault();
-    const cleanTopic = topic.trim();
+  const triggerGenerate = async () => {
+    const cleanTopic = sanitizeUserText(topic, 240, false);
     if (!cleanTopic || generating) return;
 
+    const cleanDetails = sanitizeUserText(details, 6000);
+    const cleanAudience = sanitizeUserText(audience, 160, false) || 'عام';
+
     setGenerating(true);
-    setStatusText('جاري تخطيط وبناء شرائح PowerPoint...');
+    setStatusText('جاري تخطيط وبناء شرائح العرض...');
     setError(null);
     setSuccessMsg(null);
 
     try {
       const idToken = await user.getIdToken();
-      const data = await postNdjsonOrJson<PptxDeck>('/api/nova/generate-pptx', {
-        headers: {
-          Authorization: `Bearer ${idToken}`,
-          ...getOtpHeaders(),
-        },
-        body: {
-          topic: cleanTopic,
-          details: details.trim(),
-          slideCount,
-          audience,
-          language,
-        },
-        onStatus: (msg) => setStatusText(msg),
-      });
+      const headers = {
+        Authorization: `Bearer ${idToken}`,
+        ...getOtpHeaders(),
+      };
 
-      if (!Array.isArray(data.slides)) {
-        throw new Error('تعذر إنشاء العرض التقديمي حاليًا.');
+      if (slideCount > 8) {
+        const firstCount = Math.ceil(slideCount / 2);
+        const secondCount = slideCount - firstCount;
+
+        setStatusText(`جاري بناء الجزء الأول (1 إلى ${firstCount} من ${slideCount})...`);
+        const part1 = await postNdjsonOrJson<PptxDeck>('/api/nova/generate-pptx', {
+          headers,
+          body: {
+            topic: cleanTopic,
+            details: cleanDetails,
+            slideCount: firstCount,
+            audience: cleanAudience,
+            language,
+            batchIndex: 1,
+            totalBatches: 2,
+          },
+          onStatus: (msg) => setStatusText(`الجزء 1/2: ${msg}`),
+        });
+
+        if (!Array.isArray(part1.slides) || part1.slides.length === 0) {
+          throw new Error('تعذر إنشاء الجزء الأول من العرض التقديمي.');
+        }
+
+        const freshToken = await user.getIdToken();
+        setStatusText(`جاري بناء الجزء الثاني (${firstCount + 1} إلى ${slideCount})...`);
+        const part2 = await postNdjsonOrJson<PptxDeck>('/api/nova/generate-pptx', {
+          headers: {
+            Authorization: `Bearer ${freshToken}`,
+            ...getOtpHeaders(),
+          },
+          body: {
+            topic: cleanTopic,
+            details: cleanDetails,
+            slideCount: secondCount,
+            audience: cleanAudience,
+            language,
+            batchIndex: 2,
+            totalBatches: 2,
+            targetDeckTitle: part1.deckTitle || cleanTopic,
+            existingSlideTitles: part1.slides.map((s) => s.title).slice(0, 12),
+          },
+          onStatus: (msg) => setStatusText(`الجزء 2/2: ${msg}`),
+        });
+
+        const mergedSlides = [...part1.slides, ...(Array.isArray(part2.slides) ? part2.slides : [])];
+        setDeck({
+          deckTitle: part1.deckTitle || cleanTopic,
+          deckSubtitle: part1.deckSubtitle || part2.deckSubtitle || '',
+          slides: mergedSlides,
+          language,
+        });
+      } else {
+        const data = await postNdjsonOrJson<PptxDeck>('/api/nova/generate-pptx', {
+          headers,
+          body: {
+            topic: cleanTopic,
+            details: cleanDetails,
+            slideCount,
+            audience: cleanAudience,
+            language,
+          },
+          onStatus: (msg) => setStatusText(msg),
+        });
+
+        if (!Array.isArray(data.slides)) {
+          throw new Error('تعذر إنشاء العرض التقديمي حاليًا.');
+        }
+
+        setDeck({
+          deckTitle: data.deckTitle,
+          deckSubtitle: data.deckSubtitle,
+          slides: data.slides,
+          language,
+        });
       }
 
-      setDeck({
-        deckTitle: data.deckTitle,
-        deckSubtitle: data.deckSubtitle,
-        slides: data.slides,
-        language,
-      });
-      setSuccessMsg('تم إنشاء جميع الشرائح بدقة! يمكنك مراجعتها الآن أو تحميل ملف PowerPoint مباشرة.');
+      setSuccessMsg('تم إنشاء جميع الشرائح بدقة! يمكنك تحميل العرض بصيغة PowerPoint أو PDF.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'حدث خطأ أثناء إنشاء العرض التقديمي.');
     } finally {
       setGenerating(false);
       setStatusText('');
     }
+  };
+
+  const handleGenerate = async (e: FormEvent) => {
+    e.preventDefault();
+    await triggerGenerate();
   };
 
   const handleDownload = async () => {
@@ -113,6 +181,20 @@ export function PresentationStudio({
     }
   };
 
+  const handleDownloadPdf = async () => {
+    if (!deck || downloadingPdf) return;
+    setDownloadingPdf(true);
+    setError(null);
+    try {
+      await exportDeckToPdf(deck, visualTheme, deck.language || language);
+      setSuccessMsg('تم تحميل ملف PDF للعرض بنجاح!');
+    } catch {
+      setError('تعذر تصدير ملف PDF. يرجى المحاولة مرة أخرى.');
+    } finally {
+      setDownloadingPdf(false);
+    }
+  };
+
   return (
     <div className="flex-1 min-h-0 overflow-y-auto max-w-6xl w-full mx-auto px-3.5 sm:px-6 py-5 sm:py-6 space-y-6">
       {/* Header */}
@@ -120,23 +202,34 @@ export function PresentationStudio({
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-white flex items-center gap-2.5">
             <Presentation className="w-6 h-6" style={{ color: 'var(--accent-primary)' }} />
-            <span>صانع عروض PowerPoint الذكي</span>
+            <span>صانع عروض PowerPoint وPDF الذكي</span>
           </h1>
           <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-1">
-            اكتب موضوع العرض وكل التفاصيل الدقيقة التي تريدها، وسيبني Nova AI شرائح متكاملة جاهزة للتحميل بصيغة .pptx.
+            اكتب موضوع العرض وكل التفاصيل الدقيقة التي تريدها، وسيبني Nova AI شرائح متكاملة جاهزة للتحميل بصيغة .pptx أو PDF.
           </p>
         </div>
 
         {deck && (
-          <button
-            type="button"
-            onClick={handleDownload}
-            disabled={downloading}
-            className="accent-btn inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-white text-sm font-semibold cursor-pointer disabled:opacity-50"
-          >
-            <Download className="w-4 h-4" />
-            <span>{downloading ? 'جاري التصدير...' : 'تحميل ملف PowerPoint (.pptx)'}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={handleDownload}
+              disabled={downloading || downloadingPdf}
+              className="accent-btn inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 rounded-xl text-white text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50"
+            >
+              <Download className="w-4 h-4" />
+              <span>{downloading ? 'جاري التصدير...' : 'تحميل PowerPoint (.pptx)'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleDownloadPdf}
+              disabled={downloading || downloadingPdf}
+              className="inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 rounded-xl bg-white dark:bg-[#0B1020] border border-slate-200 dark:border-white/15 hover:border-slate-300 dark:hover:border-white/30 text-slate-900 dark:text-white text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50 transition-colors"
+            >
+              <FileDown className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+              <span>{downloadingPdf ? 'جاري تجهيز PDF...' : 'تحميل بصيغة PDF'}</span>
+            </button>
+          </div>
         )}
       </div>
 
@@ -246,9 +339,23 @@ export function PresentationStudio({
           </div>
 
           {error && (
-            <div className="rounded-xl bg-rose-500/10 border border-rose-500/35 px-3.5 py-2.5 text-xs text-rose-700 dark:text-rose-200 flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
-              <span>{error}</span>
+            <div
+              role="alert"
+              className="rounded-xl bg-rose-500/10 border border-rose-500/35 px-3.5 py-2.5 text-xs text-rose-700 dark:text-rose-200 flex flex-wrap items-center justify-between gap-2.5"
+            >
+              <div className="flex items-start gap-2 min-w-0">
+                <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => triggerGenerate()}
+                disabled={generating}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer shrink-0 disabled:opacity-50"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>إعادة المحاولة</span>
+              </button>
             </div>
           )}
 

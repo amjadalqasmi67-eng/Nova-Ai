@@ -31,6 +31,7 @@ import {
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { NovaStarLogo } from './NovaStarLogo';
 import { getOtpHeaders } from '../lib/otpSession';
+import { sanitizeUserText } from '../lib/sanitize';
 
 type MessageCategory = 'issue' | 'suggestion' | 'general';
 type TriageLevel = 'pending' | 'simple' | 'urgent';
@@ -51,6 +52,7 @@ interface ContactMessageRecord {
 
 interface ContactPageProps {
   user: User;
+  displayName?: string;
   onGoToChat: () => void;
   onGoToOwnerDashboard?: () => void;
 }
@@ -81,13 +83,17 @@ const CATEGORY_OPTIONS: Array<{
   },
 ];
 
-export function ContactPage({ user, onGoToChat, onGoToOwnerDashboard }: ContactPageProps) {
-  const [senderName, setSenderName] = useState(user.displayName || '');
+export function ContactPage({ user, displayName, onGoToChat, onGoToOwnerDashboard }: ContactPageProps) {
+  const [senderName, setSenderName] = useState(displayName || user.displayName || '');
   const [category, setCategory] = useState<MessageCategory>('general');
   const [messageText, setMessageText] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [feedback, setFeedback] = useState<{
+    type: 'ok' | 'err';
+    text: string;
+    onRetry?: () => void;
+  } | null>(null);
   const [latestResult, setLatestResult] = useState<{
     messageId: string;
     triageLevel: TriageLevel;
@@ -221,16 +227,21 @@ export function ContactPage({ user, onGoToChat, onGoToOwnerDashboard }: ContactP
           : err instanceof Error
             ? err.message
             : 'تم حفظ رسالتك، لكن تعذر تحليلها تلقائيًا بالمساعد.';
-      setFeedback({ type: 'err', text: msg });
+      setFeedback({
+        type: 'err',
+        text: msg,
+        onRetry: () => {
+          runAiTriage(msgId, payload).catch(() => undefined);
+        },
+      });
     } finally {
       setAnalyzingId(null);
     }
   };
 
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    const cleanName = senderName.trim();
-    const cleanMessage = messageText.trim();
+  const submitContactMessage = async () => {
+    const cleanName = sanitizeUserText(senderName, 120, false);
+    const cleanMessage = sanitizeUserText(messageText, 3000);
 
     if (cleanName.length < 1) {
       setFeedback({ type: 'err', text: 'يرجى كتابة اسمك قبل إرسال الرسالة.' });
@@ -278,11 +289,19 @@ export function ContactPage({ user, onGoToChat, onGoToOwnerDashboard }: ContactP
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'تعذر حفظ الرسالة حاليًا، يرجى المحاولة مجددًا.',
+        onRetry: () => {
+          submitContactMessage().catch(() => undefined);
+        },
       });
       if (err instanceof Error && err.message.toLowerCase().includes('permission')) {
         handleFirestoreError(err, OperationType.CREATE, path);
       }
     }
+  };
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    await submitContactMessage();
   };
 
   const handleDelete = async (id: string) => {
@@ -444,18 +463,30 @@ export function ContactPage({ user, onGoToChat, onGoToOwnerDashboard }: ContactP
             {feedback && (
               <div
                 role="alert"
-                className={`rounded-xl px-4 py-3 text-xs sm:text-sm border flex items-start gap-2.5 leading-relaxed ${
+                className={`rounded-xl px-4 py-3 text-xs sm:text-sm border flex flex-wrap items-center justify-between gap-2.5 leading-relaxed ${
                   feedback.type === 'ok'
                     ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-200'
                     : 'bg-rose-500/10 border-rose-500/30 text-rose-700 dark:text-rose-200'
                 }`}
               >
-                {feedback.type === 'ok' ? (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
-                ) : (
-                  <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                <div className="flex items-start gap-2.5 min-w-0">
+                  {feedback.type === 'ok' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                  )}
+                  <span>{feedback.text}</span>
+                </div>
+                {feedback.type === 'err' && feedback.onRetry && (
+                  <button
+                    type="button"
+                    onClick={feedback.onRetry}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer shrink-0"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>إعادة المحاولة</span>
+                  </button>
                 )}
-                <span>{feedback.text}</span>
               </div>
             )}
 

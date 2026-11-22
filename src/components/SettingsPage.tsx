@@ -1,4 +1,4 @@
-import { useState, useRef, FormEvent, ChangeEvent } from 'react';
+import { useState, useEffect, useRef, FormEvent, ChangeEvent } from 'react';
 import {
   ArrowRight,
   Sun,
@@ -28,6 +28,7 @@ import {
 } from '../lib/theme';
 import { compressAvatarFile } from '../lib/imageUtils';
 import { PWAInstallButton } from './PWAInstallButton';
+import { sanitizeUserText } from '../lib/sanitize';
 
 interface SettingsPageProps {
   userEmail: string;
@@ -45,6 +46,7 @@ interface SettingsPageProps {
   onChangeBackground: (bg: BackgroundStyle) => void;
   onChangeFontColor: (fontColor: FontColor) => void;
   onUpdateAvatar: (avatarDataUrl: string) => Promise<void>;
+  onSaveDisplayName: (displayName: string) => Promise<void>;
   onSaveInstruction: (instruction: string) => Promise<void>;
   onUpdatePin: (pin: string | null) => void;
   onSwitchAccount: () => Promise<void>;
@@ -79,21 +81,58 @@ export function SettingsPage({
   onChangeBackground,
   onChangeFontColor,
   onUpdateAvatar,
+  onSaveDisplayName,
   onSaveInstruction,
   onUpdatePin,
   onSwitchAccount,
   onSignOut,
   onBack,
 }: SettingsPageProps) {
+  const [displayNameInput, setDisplayNameInput] = useState(displayName);
+  const [savingName, setSavingName] = useState(false);
   const [instruction, setInstruction] = useState(customInstruction);
   const [pinInput, setPinInput] = useState('');
   const [saving, setSaving] = useState(false);
   const [updatingAvatar, setUpdatingAvatar] = useState(false);
   const [switchingAccount, setSwitchingAccount] = useState(false);
-  const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [feedback, setFeedback] = useState<{
+    type: 'ok' | 'err';
+    text: string;
+    onRetry?: () => void;
+  } | null>(null);
 
   const avatarFileRef = useRef<HTMLInputElement | null>(null);
   const avatarCameraRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    setDisplayNameInput(displayName);
+  }, [displayName]);
+
+  const handleSaveNameOnly = async () => {
+    const cleanName = sanitizeUserText(displayNameInput, 120, false);
+    if (!cleanName) {
+      setFeedback({ type: 'err', text: 'يرجى إدخال اسم العرض (حرف واحد على الأقل).' });
+      return;
+    }
+
+    setSavingName(true);
+    setFeedback(null);
+    try {
+      await onSaveDisplayName(cleanName);
+      setDisplayNameInput(cleanName);
+      setFeedback({ type: 'ok', text: 'تم حفظ اسم العرض بنجاح وسيظهر في رسالة الترحيب.' });
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'تعذر حفظ اسم العرض، يرجى المحاولة مجددًا.',
+        onRetry: () => {
+          handleSaveNameOnly().catch(() => undefined);
+        },
+      });
+    } finally {
+      setSavingName(false);
+    }
+  };
 
   const handleAvatarSelected = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -130,18 +169,29 @@ export function SettingsPage({
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'تعذر إزالة الصورة.',
+        onRetry: () => {
+          handleRemoveAvatar().catch(() => undefined);
+        },
       });
     } finally {
       setUpdatingAvatar(false);
     }
   };
 
-  const handleSavePreferences = async (e: FormEvent) => {
-    e.preventDefault();
+  const saveAllPreferences = async () => {
+    const cleanName = sanitizeUserText(displayNameInput, 120, false);
+    if (!cleanName) {
+      setFeedback({ type: 'err', text: 'يرجى إدخال اسم العرض (حرف واحد على الأقل).' });
+      return;
+    }
+
     setSaving(true);
     setFeedback(null);
     try {
-      await onSaveInstruction(instruction.trim());
+      if (cleanName !== displayName) {
+        await onSaveDisplayName(cleanName);
+      }
+      await onSaveInstruction(sanitizeUserText(instruction, 1000));
       if (pinInput.trim().length >= 4) {
         onUpdatePin(pinInput.trim());
         setPinInput('');
@@ -151,10 +201,18 @@ export function SettingsPage({
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'تعذر حفظ التغييرات، يرجى المحاولة مجددًا.',
+        onRetry: () => {
+          saveAllPreferences().catch(() => undefined);
+        },
       });
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSavePreferences = async (e: FormEvent) => {
+    e.preventDefault();
+    await saveAllPreferences();
   };
 
   const handleSwitch = async () => {
@@ -166,6 +224,9 @@ export function SettingsPage({
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'تعذر تبديل الحساب حاليًا.',
+        onRetry: () => {
+          handleSwitch().catch(() => undefined);
+        },
       });
     } finally {
       setSwitchingAccount(false);
@@ -288,6 +349,39 @@ export function SettingsPage({
               <span>تسجيل الخروج</span>
             </button>
           </div>
+        </div>
+
+        {/* Display Name Field */}
+        <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#060916] border border-slate-200 dark:border-white/10 space-y-2.5">
+          <label
+            htmlFor="settings-display-name"
+            className="block text-xs sm:text-sm font-bold text-slate-900 dark:text-white"
+          >
+            اسم العرض (يظهر في الترحيب بدل اسم حساب Google)
+          </label>
+          <div className="flex flex-col sm:flex-row gap-2.5">
+            <input
+              id="settings-display-name"
+              type="text"
+              maxLength={120}
+              value={displayNameInput}
+              onChange={(e) => setDisplayNameInput(e.target.value)}
+              placeholder="اكتب الاسم الذي تفضله للترحيب..."
+              className="accent-focus flex-1 rounded-xl bg-white dark:bg-[#0B1020] border border-slate-200 dark:border-white/15 focus:outline-none px-4 py-2.5 text-sm text-slate-900 dark:text-white placeholder:text-slate-400 dark:placeholder:text-slate-500"
+            />
+            <button
+              type="button"
+              onClick={handleSaveNameOnly}
+              disabled={savingName || !displayNameInput.trim()}
+              className="accent-btn inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-white text-xs sm:text-sm font-semibold cursor-pointer disabled:opacity-50 shrink-0"
+            >
+              <Save className="w-4 h-4" />
+              <span>{savingName ? 'جاري الحفظ...' : 'حفظ الاسم'}</span>
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            يُستخدم الاسم الأول من اسم العرض في عبارة «مرحبًا ...، كيف أساعدك اليوم؟» داخل المحادثة.
+          </p>
         </div>
       </section>
 
@@ -552,13 +646,23 @@ export function SettingsPage({
         {feedback && (
           <div
             role="status"
-            className={`rounded-xl px-4 py-3 text-xs border ${
+            className={`rounded-xl px-4 py-3 text-xs border flex flex-wrap items-center justify-between gap-2.5 ${
               feedback.type === 'ok'
                 ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-200'
                 : 'bg-rose-500/10 border-rose-500/30 text-rose-700 dark:text-rose-200'
             }`}
           >
-            {feedback.text}
+            <span>{feedback.text}</span>
+            {feedback.type === 'err' && feedback.onRetry && (
+              <button
+                type="button"
+                onClick={feedback.onRetry}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold cursor-pointer shrink-0"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>إعادة المحاولة</span>
+              </button>
+            )}
           </div>
         )}
 

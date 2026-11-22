@@ -67,7 +67,8 @@ type SecurityEventType =
   | 'csrf_origin_block'
   | 'prototype_pollution_block'
   | 'auth_ban'
-  | 'otp_lockout';
+  | 'otp_lockout'
+  | 'rate_limit_block';
 
 interface SecurityEventItem {
   id: string;
@@ -91,6 +92,7 @@ const SECURITY_EVENT_LABELS: Record<SecurityEventType, string> = {
   prototype_pollution_block: 'حقول بيانات ضارة (Injection)',
   auth_ban: 'حظر مؤقت لمحاولات دخول متكررة',
   otp_lockout: 'قفل تحقق رمز Gmail بعد أخطاء متكررة',
+  rate_limit_block: 'تجاوز حد الطلبات المسموح للمستخدم',
 };
 
 const CATEGORY_LABELS: Record<MessageCategory, string> = {

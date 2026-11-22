@@ -9,6 +9,7 @@ import {
   MessageSquarePlus,
   Sparkles,
   Play,
+  RefreshCw,
 } from 'lucide-react';
 import { NovaStarLogo } from './NovaStarLogo';
 import { getOtpSessionToken, getOtpHeaders } from '../lib/otpSession';
@@ -137,6 +138,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
 
   const isMutedRef = useRef(false);
   const modeRef = useRef<'connecting' | 'live' | 'turn-fallback'>('connecting');
+  const voiceNameRef = useRef<VoiceName>(voiceName);
   const wsRef = useRef<WebSocket | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
@@ -151,10 +153,20 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
   const currentAiBufferRef = useRef('');
   const entriesRef = useRef<VoiceTurnEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const unmountedRef = useRef(false);
+  const manualFallbackRef = useRef(false);
+  const supportsLiveWsRef = useRef(true);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectTokenRef = useRef(0);
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    voiceNameRef.current = voiceName;
+  }, [voiceName]);
 
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -332,9 +344,18 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     }
   };
 
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  };
+
   const cleanupLiveSocketOnly = () => {
+    clearReconnectTimer();
     if (processorRef.current) {
       try {
+        processorRef.current.onaudioprocess = null;
         processorRef.current.disconnect();
       } catch {
         // ignore
@@ -343,6 +364,10 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     }
     if (wsRef.current) {
       try {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
         wsRef.current.close();
       } catch {
         // ignore
@@ -351,7 +376,10 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     }
   };
 
-  const switchToTurnFallback = (message?: string) => {
+  const switchToTurnFallback = (message?: string, userInitiated = false) => {
+    if (userInitiated) {
+      manualFallbackRef.current = true;
+    }
     cleanupLiveSocketOnly();
     modeRef.current = 'turn-fallback';
     setMode('turn-fallback');
@@ -359,6 +387,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
   };
 
   const cleanupAllAudio = () => {
+    clearReconnectTimer();
     stopPlaybackQueue();
     cleanupLiveSocketOnly();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -464,155 +493,238 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     source.start(startAt);
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  const openLiveWebSocket = async (
+    stream: MediaStream,
+    inputCtx: AudioContext,
+    outputCtx: AudioContext,
+    attemptToken: number
+  ) => {
+    if (unmountedRef.current || manualFallbackRef.current || connectTokenRef.current !== attemptToken) {
+      return;
+    }
 
-    const initLiveVoice = async () => {
-      cleanupAllAudio();
-      setMode('connecting');
-      setError(null);
-      setStatusText('جاري فتح خط المحادثة الصوتية المباشرة...');
+    cleanupLiveSocketOnly();
 
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        mediaStreamRef.current = stream;
+    let idToken = '';
+    try {
+      idToken = await user.getIdToken();
+    } catch {
+      setError('تعذر تجديد جلسة التحقق للصوت المباشر.');
+      switchToTurnFallback('تم التحويل للمحادثة الصوتية التفاعلية — اضغط للتحدث');
+      return;
+    }
 
-        const inputCtx = createAudioContextSafe(16000);
-        const outputCtx = createAudioContextSafe(24000);
-        inputAudioCtxRef.current = inputCtx;
-        outputAudioCtxRef.current = outputCtx;
-        nextStartTimeRef.current = outputCtx.currentTime;
+    if (unmountedRef.current || manualFallbackRef.current || connectTokenRef.current !== attemptToken) {
+      return;
+    }
 
-        await inputCtx.resume().catch(() => undefined);
-        await outputCtx.resume().catch(() => undefined);
-        if (outputCtx.state === 'suspended') {
-          setAudioBlocked(true);
-        }
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProto}//${window.location.host}/api/nova/live`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
 
-        const idToken = await user.getIdToken();
-        if (cancelled) return;
+    let openedSuccessfully = false;
+    let settledFailure = false;
 
-        const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${wsProto}//${window.location.host}/api/nova/live`;
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
+    const scheduleAutoReconnectOrFallback = (reasonText?: string) => {
+      if (
+        settledFailure ||
+        unmountedRef.current ||
+        manualFallbackRef.current ||
+        connectTokenRef.current !== attemptToken
+      ) {
+        return;
+      }
+      settledFailure = true;
+      cleanupLiveSocketOnly();
 
-        ws.onopen = () => {
-          if (cancelled || ws.readyState !== WebSocket.OPEN) return;
-          ws.send(
-            JSON.stringify({
-              type: 'auth',
-              token: idToken,
-              otpToken: getOtpSessionToken() || '',
-              voice: voiceName,
-              instruction: customInstruction.slice(0, 400),
-            })
-          );
-        };
-
-        let openedSuccessfully = false;
-        fallbackTimer = setTimeout(() => {
-          if (!openedSuccessfully && !cancelled) {
-            switchToTurnFallback('اضغط للتحدث مع Nova AI صوتيًا');
-          }
-        }, 5500);
-
-        ws.onmessage = (event) => {
-          if (cancelled) return;
-          try {
-            const msg = JSON.parse(event.data as string) as {
-              ready?: boolean;
-              audio?: string;
-              inputTranscript?: string;
-              outputTranscript?: string;
-              interrupted?: boolean;
-              turnComplete?: boolean;
-              error?: string;
-            };
-
-            if (msg.ready) {
-              openedSuccessfully = true;
-              if (fallbackTimer) clearTimeout(fallbackTimer);
-              setMode('live');
-              setStatusText('أنا أستمع إليك الآن... تكلّم وسأرد عليك بصوتي!');
-
-              inputCtx.resume().catch(() => undefined);
-              outputCtx.resume().catch(() => undefined);
-
-              const source = inputCtx.createMediaStreamSource(stream);
-              const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-              processorRef.current = processor;
-
-              processor.onaudioprocess = (ev) => {
-                if (isMutedRef.current || ws.readyState !== WebSocket.OPEN) return;
-                const channel = ev.inputBuffer.getChannelData(0);
-                const base64 = downsampleTo16kPCM(channel, inputCtx.sampleRate);
-                ws.send(JSON.stringify({ audio: base64 }));
-              };
-
-              source.connect(processor);
-              const silentGain = inputCtx.createGain();
-              silentGain.gain.value = 0;
-              processor.connect(silentGain);
-              silentGain.connect(inputCtx.destination);
-            } else if (msg.audio) {
-              play24kChunk(msg.audio).catch(() => undefined);
-            } else if (msg.inputTranscript) {
-              upsertDraftEntry('user', msg.inputTranscript);
-            } else if (msg.outputTranscript) {
-              upsertDraftEntry('assistant', msg.outputTranscript);
-            } else if (msg.interrupted) {
-              stopPlaybackQueue();
-              finalizeDraftIds();
-            } else if (msg.turnComplete) {
-              finalizeDraftIds();
-            } else if (msg.error) {
-              if (fallbackTimer) clearTimeout(fallbackTimer);
-              switchToTurnFallback('تم التحويل للمحادثة الصوتية التفاعلية — اضغط للتحدث');
-            }
-          } catch {
-            // ignore
-          }
-        };
-
-        ws.onerror = () => {
-          if (!cancelled) {
-            if (fallbackTimer) clearTimeout(fallbackTimer);
-            switchToTurnFallback('اضغط للتحدث مع Nova AI صوتيًا');
-          }
-        };
-
-        ws.onclose = () => {
-          if (!cancelled && modeRef.current !== 'turn-fallback') {
-            if (fallbackTimer) clearTimeout(fallbackTimer);
-            switchToTurnFallback('اضغط للتحدث مع Nova AI صوتيًا');
-          }
-        };
-      } catch {
-        if (!cancelled) {
-          setError('يرجى السماح بالوصول إلى الميكروفون للتحدث مع Nova AI.');
-          setMode('turn-fallback');
-          setStatusText('الميكروفون غير متاح أو يحتاج إذنًا');
-        }
+      if (supportsLiveWsRef.current && reconnectAttemptsRef.current < 3) {
+        reconnectAttemptsRef.current += 1;
+        const attemptNum = reconnectAttemptsRef.current;
+        setMode('connecting');
+        modeRef.current = 'connecting';
+        setError(null);
+        setStatusText(`انقطع الاتصال الصوتي، جاري إعادة الاتصال تلقائيًا (المحاولة ${attemptNum} من 3)...`);
+        reconnectTimerRef.current = setTimeout(() => {
+          openLiveWebSocket(stream, inputCtx, outputCtx, attemptToken).catch(() => undefined);
+        }, attemptNum * 1000);
+      } else {
+        setError(
+          reasonText ||
+            'انقطع الاتصال بالبث الصوتي المباشر وتعذر استعادته تلقائيًا. يمكنك المتابعة عبر الضغط للتحدث أو إعادة المحاولة.'
+        );
+        switchToTurnFallback('تم التحويل لوضع الضغط للتحدث مع Nova AI');
       }
     };
 
-    initLiveVoice();
+    const connectTimeout = setTimeout(() => {
+      if (!openedSuccessfully) {
+        scheduleAutoReconnectOrFallback();
+      }
+    }, 6000);
+
+    ws.onopen = () => {
+      if (unmountedRef.current || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(
+        JSON.stringify({
+          type: 'auth',
+          token: idToken,
+          otpToken: getOtpSessionToken() || '',
+          voice: voiceNameRef.current,
+          instruction: customInstruction.slice(0, 400),
+        })
+      );
+    };
+
+    ws.onmessage = (event) => {
+      if (unmountedRef.current || connectTokenRef.current !== attemptToken) return;
+      try {
+        const msg = JSON.parse(event.data as string) as {
+          ready?: boolean;
+          audio?: string;
+          inputTranscript?: string;
+          outputTranscript?: string;
+          interrupted?: boolean;
+          turnComplete?: boolean;
+          error?: string;
+        };
+
+        if (msg.ready) {
+          openedSuccessfully = true;
+          clearTimeout(connectTimeout);
+          reconnectAttemptsRef.current = 0;
+          setError(null);
+          setMode('live');
+          modeRef.current = 'live';
+          setStatusText('أنا أستمع إليك الآن... تكلّم وسأرد عليك بصوتي!');
+
+          inputCtx.resume().catch(() => undefined);
+          outputCtx.resume().catch(() => undefined);
+
+          const source = inputCtx.createMediaStreamSource(stream);
+          const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+          processorRef.current = processor;
+
+          processor.onaudioprocess = (ev) => {
+            if (isMutedRef.current || ws.readyState !== WebSocket.OPEN) return;
+            const channel = ev.inputBuffer.getChannelData(0);
+            const base64 = downsampleTo16kPCM(channel, inputCtx.sampleRate);
+            ws.send(JSON.stringify({ audio: base64 }));
+          };
+
+          source.connect(processor);
+          const silentGain = inputCtx.createGain();
+          silentGain.gain.value = 0;
+          processor.connect(silentGain);
+          silentGain.connect(inputCtx.destination);
+        } else if (msg.audio) {
+          play24kChunk(msg.audio).catch(() => undefined);
+        } else if (msg.inputTranscript) {
+          upsertDraftEntry('user', msg.inputTranscript);
+        } else if (msg.outputTranscript) {
+          upsertDraftEntry('assistant', msg.outputTranscript);
+        } else if (msg.interrupted) {
+          stopPlaybackQueue();
+          finalizeDraftIds();
+        } else if (msg.turnComplete) {
+          finalizeDraftIds();
+        } else if (msg.error) {
+          clearTimeout(connectTimeout);
+          scheduleAutoReconnectOrFallback(msg.error);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    ws.onerror = () => {
+      clearTimeout(connectTimeout);
+      scheduleAutoReconnectOrFallback();
+    };
+
+    ws.onclose = () => {
+      clearTimeout(connectTimeout);
+      if (modeRef.current !== 'turn-fallback') {
+        scheduleAutoReconnectOrFallback();
+      }
+    };
+  };
+
+  const startLiveVoiceSession = async () => {
+    const attemptToken = ++connectTokenRef.current;
+    unmountedRef.current = false;
+    manualFallbackRef.current = false;
+    reconnectAttemptsRef.current = 0;
+
+    cleanupAllAudio();
+    setMode('connecting');
+    modeRef.current = 'connecting';
+    setError(null);
+    setStatusText('جاري فتح خط المحادثة الصوتية المباشرة...');
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (unmountedRef.current || connectTokenRef.current !== attemptToken) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      mediaStreamRef.current = stream;
+
+      const inputCtx = createAudioContextSafe(16000);
+      const outputCtx = createAudioContextSafe(24000);
+      inputAudioCtxRef.current = inputCtx;
+      outputAudioCtxRef.current = outputCtx;
+      nextStartTimeRef.current = outputCtx.currentTime;
+
+      await inputCtx.resume().catch(() => undefined);
+      await outputCtx.resume().catch(() => undefined);
+      if (outputCtx.state === 'suspended') {
+        setAudioBlocked(true);
+      }
+
+      supportsLiveWsRef.current = true;
+      try {
+        const healthRes = await fetch('/api/health', { signal: AbortSignal.timeout(2500) });
+        if (healthRes.ok) {
+          const health = (await healthRes.json()) as { liveWsSupported?: boolean };
+          if (health.liveWsSupported === false) {
+            supportsLiveWsRef.current = false;
+          }
+        }
+      } catch {
+        // Proceed to WebSocket probe if health check fails transiently
+      }
+
+      if (unmountedRef.current || connectTokenRef.current !== attemptToken) return;
+
+      if (!supportsLiveWsRef.current) {
+        switchToTurnFallback('المحادثة الصوتية التفاعلية جاهزة — اضغط للتحدث وسيرد عليك Nova AI بصوته');
+        return;
+      }
+
+      await openLiveWebSocket(stream, inputCtx, outputCtx, attemptToken);
+    } catch {
+      if (!unmountedRef.current && connectTokenRef.current === attemptToken) {
+        setError('يرجى السماح بالوصول إلى الميكروفون للتحدث مع Nova AI.');
+        setMode('turn-fallback');
+        modeRef.current = 'turn-fallback';
+        setStatusText('الميكروفون غير متاح أو يحتاج إذنًا');
+      }
+    }
+  };
+
+  useEffect(() => {
+    startLiveVoiceSession().catch(() => undefined);
 
     return () => {
-      cancelled = true;
-      if (fallbackTimer) clearTimeout(fallbackTimer);
+      unmountedRef.current = true;
+      connectTokenRef.current += 1;
       cleanupAllAudio();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -780,10 +892,21 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
             {mode === 'live' && (
               <button
                 type="button"
-                onClick={() => switchToTurnFallback('التسجيل اليدوي: اضغط للتحدث الآن وسيرد Nova AI بصوته')}
+                onClick={() => switchToTurnFallback('التسجيل اليدوي: اضغط للتحدث الآن وسيرد Nova AI بصوته', true)}
                 className="px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-[11px] font-semibold text-slate-700 dark:text-slate-200 cursor-pointer whitespace-nowrap"
               >
                 وضع الضغط للتحدث
+              </button>
+            )}
+            {mode === 'turn-fallback' && supportsLiveWsRef.current && (
+              <button
+                type="button"
+                onClick={() => {
+                  startLiveVoiceSession().catch(() => undefined);
+                }}
+                className="px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-[11px] font-semibold text-slate-700 dark:text-slate-200 cursor-pointer whitespace-nowrap"
+              >
+                الاتصال المباشر
               </button>
             )}
             <select
@@ -836,7 +959,24 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
               </button>
             )}
 
-            {error && <p className="text-xs text-rose-500">{error}</p>}
+            {error && (
+              <div
+                role="alert"
+                className="rounded-xl bg-rose-500/10 border border-rose-500/30 px-3 py-2 text-xs text-rose-600 dark:text-rose-200 flex flex-wrap items-center justify-center gap-2"
+              >
+                <span>{error}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    startLiveVoiceSession().catch(() => undefined);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-semibold cursor-pointer"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>إعادة المحاولة</span>
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
