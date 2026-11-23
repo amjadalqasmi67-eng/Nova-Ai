@@ -230,29 +230,54 @@ function NovaApplication() {
         }
 
         try {
-          let idToken = await firebaseUser.getIdToken();
-          let otpRes = await fetch('/api/auth/otp/status', {
-            headers: {
-              Authorization: `Bearer ${idToken}`,
-              ...getOtpHeaders(),
-            },
-          });
-          if (otpRes.status === 401) {
-            idToken = await firebaseUser.getIdToken(true);
-            otpRes = await fetch('/api/auth/otp/status', {
-              headers: {
-                Authorization: `Bearer ${idToken}`,
-                ...getOtpHeaders(),
-              },
-            });
+          let otpData: {
+            otpRequired?: boolean;
+            otpToken?: string;
+            emailMasked?: string;
+            cooldownRemainingSec?: number;
+          } | null = null;
+          let resolvedOk = false;
+
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              let idToken = await firebaseUser.getIdToken(attempt > 0);
+              let otpRes = await fetch('/api/auth/otp/status', {
+                credentials: 'same-origin',
+                headers: {
+                  Authorization: `Bearer ${idToken}`,
+                  ...getOtpHeaders(),
+                },
+              });
+              if (otpRes.status === 401) {
+                idToken = await firebaseUser.getIdToken(true);
+                otpRes = await fetch('/api/auth/otp/status', {
+                  credentials: 'same-origin',
+                  headers: {
+                    Authorization: `Bearer ${idToken}`,
+                    ...getOtpHeaders(),
+                  },
+                });
+              }
+              if (otpRes.ok) {
+                otpData = await otpRes.json();
+                resolvedOk = true;
+                break;
+              }
+              if (otpRes.status >= 500 && attempt < 2) {
+                await new Promise((r) => setTimeout(r, (attempt + 1) * 650));
+                continue;
+              }
+              break;
+            } catch (fetchErr) {
+              if (attempt < 2 && (typeof navigator === 'undefined' || navigator.onLine)) {
+                await new Promise((r) => setTimeout(r, (attempt + 1) * 650));
+                continue;
+              }
+              throw fetchErr;
+            }
           }
-          if (otpRes.ok) {
-            const otpData = (await otpRes.json()) as {
-              otpRequired?: boolean;
-              otpToken?: string;
-              emailMasked?: string;
-              cooldownRemainingSec?: number;
-            };
+
+          if (resolvedOk && otpData) {
             if (otpData.otpToken) {
               setOtpSessionToken(otpData.otpToken);
             }
@@ -346,15 +371,33 @@ function NovaApplication() {
     try {
       const current = auth.currentUser;
       if (current) {
-        const idToken = await current.getIdToken();
-        await fetch('/api/auth/otp/logout', {
+        let idToken = await current.getIdToken();
+        const logoutHeaders = getOtpHeaders();
+        let res = await fetch('/api/auth/otp/logout', {
           method: 'POST',
+          credentials: 'same-origin',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${idToken}`,
+            'X-Requested-With': 'NovaAI',
+            ...logoutHeaders,
           },
           body: JSON.stringify({}),
         });
+        if (res.status === 401) {
+          idToken = await current.getIdToken(true);
+          await fetch('/api/auth/otp/logout', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${idToken}`,
+              'X-Requested-With': 'NovaAI',
+              ...logoutHeaders,
+            },
+            body: JSON.stringify({}),
+          });
+        }
       }
     } catch {
       // Non-blocking logout cleanup

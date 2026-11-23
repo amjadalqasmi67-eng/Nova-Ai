@@ -15,6 +15,11 @@ import { NovaStarLogo } from './NovaStarLogo';
 import { getOtpSessionToken, getOtpHeaders } from '../lib/otpSession';
 import { consumePrimedOutputAudioContext, createAudioContextSafe } from '../lib/audioUnlock';
 import { cleanTextForSpeech, pickBestArabicBrowserVoice } from '../lib/voiceReader';
+import {
+  PcmStreamJitterBuffer,
+  decodeAudioBytesToPcmFloat32,
+  splitArabicSpeechSentences,
+} from '../../speechUtils';
 
 interface VoiceTurnEntry {
   id: string;
@@ -203,6 +208,13 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectTokenRef = useRef(0);
   const lastUiMeterUpdateRef = useRef(0);
+  const pcmJitterBufferRef = useRef(
+    new PcmStreamJitterBuffer({ initialPrebufferMs: 420, blockTargetMs: 240, sampleRate: 24000 })
+  );
+  const wsKeepaliveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const bargeInSpeechFramesRef = useRef(0);
+  const streamedAudioAbortRef = useRef<AbortController | null>(null);
+  const liveDropNoticeRef = useRef(false);
 
   // Auto-VAD state refs (used automatically in auto-vad mode with zero button presses)
   const vadPreRollRef = useRef<Float32Array[]>([]);
@@ -276,6 +288,11 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
   };
 
   const stopPlaybackQueue = () => {
+    pcmJitterBufferRef.current.reset();
+    if (streamedAudioAbortRef.current) {
+      streamedAudioAbortRef.current.abort();
+      streamedAudioAbortRef.current = null;
+    }
     activeSourcesRef.current.forEach((src) => {
       try {
         src.stop();
@@ -317,10 +334,15 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     }
   };
 
-  const getListeningReadyStatus = () =>
-    isMutedRef.current
-      ? 'الميكروفون مكتوم — اضغط لفتحه والتحدث'
-      : 'أنا أستمع إليك الآن... قل «السلام عليكم» أو اسأل أي شيء مباشرة';
+  const getListeningReadyStatus = () => {
+    if (isMutedRef.current) {
+      return 'الميكروفون مكتوم — اضغط لفتحه والتحدث';
+    }
+    if (liveDropNoticeRef.current && modeRef.current === 'auto-vad') {
+      return 'الوضع التلقائي المتدفق نشط — تحدّث مباشرة وسيرد نوفا بجمل متصلة واضحة';
+    }
+    return 'أنا أستمع إليك الآن... قل «السلام عليكم» أو اسأل أي شيء مباشرة';
+  };
 
   const speakWithBrowserFallback = (text: string) => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window) || !text.trim()) {
@@ -331,37 +353,36 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     try {
       const voices = window.speechSynthesis.getVoices();
       const arabicVoice = pickBestArabicBrowserVoice(voices);
-      if (!arabicVoice) {
+      const sentences = splitArabicSpeechSentences(text, 105, 28);
+      if (!arabicVoice || sentences.length === 0) {
         setAiSpeakingState(false);
         setStatusText('تم عرض الرد كتابيًا — أستمع إليك الآن');
         return;
       }
 
       window.speechSynthesis.cancel();
-      const cleanSpeech = cleanTextForSpeech(text);
-      if (!cleanSpeech) {
-        setAiSpeakingState(false);
-        setStatusText(getListeningReadyStatus());
-        return;
-      }
+      let idx = 0;
+      setAiSpeakingState(true);
+      setStatusText('نوفا يتحدث الآن...');
 
-      const utterance = new SpeechSynthesisUtterance(cleanSpeech);
-      utterance.voice = arabicVoice;
-      utterance.lang = arabicVoice.lang || 'ar-SA';
-      utterance.rate = 0.98;
-      utterance.onstart = () => {
-        setAiSpeakingState(true);
-        setStatusText('نوفا يتحدث الآن...');
+      const speakNext = () => {
+        if (unmountedRef.current || idx >= sentences.length) {
+          setAiSpeakingState(false);
+          setStatusText(getListeningReadyStatus());
+          return;
+        }
+        const utterance = new SpeechSynthesisUtterance(sentences[idx++]);
+        utterance.voice = arabicVoice;
+        utterance.lang = arabicVoice.lang || 'ar-SA';
+        utterance.rate = 0.98;
+        utterance.onend = speakNext;
+        utterance.onerror = () => {
+          setAiSpeakingState(false);
+          setStatusText(getListeningReadyStatus());
+        };
+        window.speechSynthesis.speak(utterance);
       };
-      utterance.onend = () => {
-        setAiSpeakingState(false);
-        setStatusText(getListeningReadyStatus());
-      };
-      utterance.onerror = () => {
-        setAiSpeakingState(false);
-        setStatusText(getListeningReadyStatus());
-      };
-      window.speechSynthesis.speak(utterance);
+      speakNext();
     } catch {
       setAiSpeakingState(false);
       setStatusText(getListeningReadyStatus());
@@ -465,8 +486,16 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     }
   };
 
+  const clearWsKeepaliveTimer = () => {
+    if (wsKeepaliveTimerRef.current) {
+      clearInterval(wsKeepaliveTimerRef.current);
+      wsKeepaliveTimerRef.current = null;
+    }
+  };
+
   const cleanupLiveSocketOnly = () => {
     clearReconnectTimer();
+    clearWsKeepaliveTimer();
     cleanupProcessorOnly();
     if (wsRef.current) {
       try {
@@ -536,7 +565,12 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     );
   };
 
-  const play24kChunk = async (base64Audio: string) => {
+  const schedulePcmSamples = async (
+    samples: Float32Array,
+    sampleRate = 24000,
+    onAllEnded?: () => void
+  ) => {
+    if (samples.length === 0) return;
     let ctx = outputAudioCtxRef.current;
     if (!ctx || ctx.state === 'closed') {
       ctx = consumePrimedOutputAudioContext();
@@ -556,20 +590,17 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     }
     setAudioBlocked(false);
 
-    const float32 = base64ToFloat32From24kPCM(base64Audio);
-    if (float32.length === 0) return;
-
-    const buffer = ctx.createBuffer(1, float32.length, 24000);
-    buffer.getChannelData(0).set(float32);
+    const buffer = ctx.createBuffer(1, samples.length, sampleRate);
+    buffer.getChannelData(0).set(samples);
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
 
-    // Gapless scheduling: add tiny 60ms cushion only at the start of an utterance or after an underrun
+    // Smooth lead-in cushion (100ms) on fresh utterance or recovery after gap
     const now = ctx.currentTime;
-    if (nextStartTimeRef.current < now - 0.005) {
-      nextStartTimeRef.current = now + 0.06;
+    if (nextStartTimeRef.current < now + 0.015) {
+      nextStartTimeRef.current = now + 0.1;
     }
     const startAt = nextStartTimeRef.current;
     nextStartTimeRef.current = startAt + buffer.duration;
@@ -582,7 +613,8 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
 
     source.onended = () => {
       activeSourcesRef.current.delete(source);
-      if (activeSourcesRef.current.size === 0) {
+      if (activeSourcesRef.current.size === 0 && pcmJitterBufferRef.current.bufferedSamples === 0) {
+        onAllEnded?.();
         setAiSpeakingState(false);
         if (modeRef.current === 'live' || modeRef.current === 'auto-vad') {
           setStatusText(getListeningReadyStatus());
@@ -591,6 +623,25 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     };
 
     source.start(startAt);
+  };
+
+  const play24kChunk = async (base64Audio: string | null, flushTurn = false) => {
+    if (base64Audio) {
+      const float32 = base64ToFloat32From24kPCM(base64Audio);
+      if (float32.length > 0) {
+        pcmJitterBufferRef.current.push(float32);
+      }
+    }
+
+    // Hold playback briefly at turn start until enough buffered audio arrives (~420ms) or turn completes
+    if (pcmJitterBufferRef.current.hasStarted && !isAiSpeakingRef.current && !flushTurn) {
+      setStatusText('نوفا يستعد للرد...');
+    }
+
+    const readyBlocks = pcmJitterBufferRef.current.popReadyBlocks(flushTurn);
+    for (const block of readyBlocks) {
+      await schedulePcmSamples(block, 24000);
+    }
   };
 
   const submitAutoVadTurn = async (capturedSamples: Float32Array, attemptToken: number) => {
@@ -603,75 +654,223 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
     setStatusText('نوفا يستمع ويفكّر في الرد...');
     setError(null);
 
+    const turnAbort = new AbortController();
+    streamedAudioAbortRef.current = turnAbort;
+
     try {
+      await unlockAudioContexts();
       const wavBase64 = encode16kFloatToWavBase64(capturedSamples);
-      const idToken = await user.getIdToken();
+      let idToken = await user.getIdToken();
       if (unmountedRef.current || connectTokenRef.current !== attemptToken) return;
 
-      const res = await fetch('/api/nova/voice-turn', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-          ...getOtpHeaders(),
-        },
-        body: JSON.stringify({
-          audioBase64: wavBase64,
-          mimeType: 'audio/wav',
-          voiceName: voiceNameRef.current,
-          customInstruction,
-          history: entriesRef.current.slice(-6).map((e) => ({ role: e.role, content: e.text })),
-        }),
-      });
+      const doFetch = (token: string) =>
+        fetch('/api/nova/voice-turn', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            ...getOtpHeaders(),
+          },
+          body: JSON.stringify({
+            audioBase64: wavBase64,
+            mimeType: 'audio/wav',
+            voiceName: voiceNameRef.current,
+            customInstruction,
+            history: entriesRef.current.slice(-6).map((e) => ({ role: e.role, content: e.text })),
+            stream: true,
+          }),
+          signal: turnAbort.signal,
+        });
 
-      const rawText = await res.text();
-      if (rawText.trimStart().startsWith('<')) {
-        throw new Error('انقطع الاتصال المؤقت بالخادم. يرجى إعادة المحاولة.');
+      let res = await doFetch(idToken);
+      if (res.status === 401) {
+        idToken = await user.getIdToken(true);
+        res = await doFetch(idToken);
       }
 
-      let data: {
-        userTranscript?: string;
-        replyText?: string;
-        noSpeechDetected?: boolean;
-        audioBase64?: string | null;
-        mimeType?: string | null;
-        error?: string;
-      };
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        throw new Error('استجابة غير صالحة من الخادم.');
+      const contentType = res.headers.get('content-type') || '';
+
+      if (!res.ok) {
+        const rawErr = await res.text();
+        if (rawErr.trimStart().startsWith('<')) {
+          throw new Error('انقطع الاتصال المؤقت بالخادم. يرجى إعادة المحاولة.');
+        }
+        const parsedErr = JSON.parse(rawErr) as { error?: string };
+        throw new Error(parsedErr.error || 'تعذر معالجة الصوت');
       }
 
-      if (data.noSpeechDetected) {
-        setStatusText(getListeningReadyStatus());
+      // Backwards-compatible non-streamed JSON path
+      if (!contentType.includes('application/x-ndjson') || !res.body) {
+        const rawText = await res.text();
+        if (rawText.trimStart().startsWith('<')) {
+          throw new Error('انقطع الاتصال المؤقت بالخادم. يرجى إعادة المحاولة.');
+        }
+        const data = JSON.parse(rawText) as {
+          userTranscript?: string;
+          replyText?: string;
+          noSpeechDetected?: boolean;
+          audioBase64?: string | null;
+          mimeType?: string | null;
+          error?: string;
+        };
+        if (data.noSpeechDetected) {
+          setStatusText(getListeningReadyStatus());
+          return;
+        }
+        if (!data.replyText) {
+          throw new Error(data.error || 'تعذر معالجة الصوت');
+        }
+        const newTurns: VoiceTurnEntry[] = [];
+        if (data.userTranscript) {
+          newTurns.push({ id: `u-${Date.now()}`, role: 'user', text: data.userTranscript });
+        }
+        newTurns.push({
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          text: data.replyText,
+          audioBase64: data.audioBase64,
+          mimeType: data.mimeType,
+        });
+        setEntries((prev) => [...prev, ...newTurns]);
+        await playReplyAudio(data.audioBase64, data.mimeType, data.replyText);
         return;
       }
 
-      if (!res.ok || !data.replyText) {
-        throw new Error(data.error || 'تعذر معالجة الصوت');
+      // Pipelined short-sentence NDJSON streaming path with pre-buffering
+      stopPlaybackQueue();
+      const pendingSentenceAudio: Array<{ samples: Float32Array; sampleRate: number }> = [];
+      let pendingDurSec = 0;
+      let expectedSentences = 1;
+      let streamCompleted = false;
+      let playbackStarted = false;
+      let receivedAnyAudio = false;
+      let transcriptReplyText = '';
+      let noSpeech = false;
+
+      const flushSentenceAudioQueue = async (forceFlush: boolean) => {
+        if (unmountedRef.current || connectTokenRef.current !== attemptToken || pendingSentenceAudio.length === 0) {
+          return;
+        }
+        const readyToStart =
+          playbackStarted ||
+          forceFlush ||
+          streamCompleted ||
+          (pendingDurSec >= 0.5 &&
+            (expectedSentences <= 1 || pendingSentenceAudio.length >= 2 || pendingDurSec >= 1.25));
+
+        if (!readyToStart) return;
+        playbackStarted = true;
+
+        while (pendingSentenceAudio.length > 0) {
+          const item = pendingSentenceAudio.shift()!;
+          pendingDurSec -= item.samples.length / item.sampleRate;
+          await schedulePcmSamples(item.samples, item.sampleRate);
+        }
+        pendingDurSec = 0;
+      };
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      const processLine = async (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let evt: {
+          type?: string;
+          userTranscript?: string;
+          replyText?: string;
+          noSpeechDetected?: boolean;
+          sentenceCount?: number;
+          audioBase64?: string;
+          error?: string;
+        };
+        try {
+          evt = JSON.parse(trimmed);
+        } catch {
+          return;
+        }
+
+        if (evt.type === 'ping') return;
+        if (evt.type === 'transcript') {
+          if (evt.noSpeechDetected) {
+            noSpeech = true;
+            setStatusText(getListeningReadyStatus());
+            return;
+          }
+          expectedSentences = Math.max(1, evt.sentenceCount ?? 1);
+          transcriptReplyText = evt.replyText || '';
+          const newTurns: VoiceTurnEntry[] = [];
+          if (evt.userTranscript) {
+            newTurns.push({ id: `u-${Date.now()}`, role: 'user', text: evt.userTranscript });
+          }
+          if (transcriptReplyText) {
+            newTurns.push({
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              text: transcriptReplyText,
+            });
+          }
+          if (newTurns.length > 0) {
+            setEntries((prev) => [...prev, ...newTurns]);
+          }
+          if (expectedSentences > 1) {
+            setStatusText('جاري تجهيز الصوت المتصل بالرد...');
+          }
+        } else if (evt.type === 'audio_chunk' && evt.audioBase64) {
+          const bytes = base64ToUint8Array(evt.audioBase64);
+          const { samples, sampleRate } = decodeAudioBytesToPcmFloat32(bytes);
+          if (samples.length > 0) {
+            receivedAnyAudio = true;
+            pendingSentenceAudio.push({ samples, sampleRate });
+            pendingDurSec += samples.length / sampleRate;
+            await flushSentenceAudioQueue(false);
+          }
+        } else if (evt.type === 'done') {
+          streamCompleted = true;
+          await flushSentenceAudioQueue(true);
+        } else if (evt.type === 'error') {
+          throw new Error(evt.error || 'تعذر معالجة الصوت');
+        }
+      };
+
+      while (true) {
+        if (unmountedRef.current || connectTokenRef.current !== attemptToken) {
+          reader.cancel().catch(() => undefined);
+          return;
+        }
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          await processLine(line);
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        await processLine(buffer);
       }
 
-      const newTurns: VoiceTurnEntry[] = [];
-      if (data.userTranscript) {
-        newTurns.push({ id: `u-${Date.now()}`, role: 'user', text: data.userTranscript });
-      }
-      newTurns.push({
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        text: data.replyText,
-        audioBase64: data.audioBase64,
-        mimeType: data.mimeType,
-      });
-      setEntries((prev) => [...prev, ...newTurns]);
+      if (noSpeech) return;
 
-      await playReplyAudio(data.audioBase64, data.mimeType, data.replyText);
+      streamCompleted = true;
+      await flushSentenceAudioQueue(true);
+
+      if (!receivedAnyAudio && transcriptReplyText) {
+        speakWithBrowserFallback(transcriptReplyText);
+      }
     } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') return;
       if (!unmountedRef.current && connectTokenRef.current === attemptToken) {
         setError(err instanceof Error ? err.message : 'تعذر إرسال الصوت');
         setStatusText(getListeningReadyStatus());
       }
     } finally {
+      if (streamedAudioAbortRef.current === turnAbort) {
+        streamedAudioAbortRef.current = null;
+      }
       if (!unmountedRef.current && connectTokenRef.current === attemptToken) {
         isProcessingTurnRef.current = false;
         setIsProcessingTurn(false);
@@ -834,6 +1033,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
 
     let openedSuccessfully = false;
     let settledFailure = false;
+    let readyAtMs = 0;
 
     const scheduleAutoReconnectOrVad = () => {
       if (settledFailure || unmountedRef.current || connectTokenRef.current !== attemptToken) {
@@ -842,18 +1042,25 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
       settledFailure = true;
       cleanupLiveSocketOnly();
 
-      if (supportsLiveWsRef.current && reconnectAttemptsRef.current < 2) {
+      // If WebSocket held steady for >= 25 seconds, reset reconnect budget so sudden proxy drops recover cleanly
+      if (readyAtMs > 0 && Date.now() - readyAtMs >= 25000) {
+        reconnectAttemptsRef.current = 0;
+      }
+
+      if (supportsLiveWsRef.current && reconnectAttemptsRef.current < 3) {
         reconnectAttemptsRef.current += 1;
         const attemptNum = reconnectAttemptsRef.current;
         setMode('connecting');
         modeRef.current = 'connecting';
         setError(null);
-        setStatusText(`جاري إعادة وصل الصوت المباشر تلقائيًا (${attemptNum} من 2)...`);
+        setStatusText(`انقطع الاتصال لحظيًا — جاري إعادة وصل الصوت تلقائيًا (${attemptNum} من 3)...`);
+        const backoffMs = Math.min(2500, attemptNum * 750);
         reconnectTimerRef.current = setTimeout(() => {
           openLiveWebSocket(stream, inputCtx, outputCtx, attemptToken).catch(() => undefined);
-        }, attemptNum * 900);
+        }, backoffMs);
       } else {
-        // Seamlessly switch to Hands-Free Auto-VAD with ZERO manual button required
+        // Fallback seamlessly to sentence-pipelined Auto-VAD when hosting drops persistent WS
+        liveDropNoticeRef.current = true;
         startHandsFreeAutoVad(stream, inputCtx, attemptToken);
       }
     };
@@ -873,8 +1080,19 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
           otpToken: getOtpSessionToken() || '',
           voice: voiceNameRef.current,
           instruction: customInstruction.slice(0, 400),
+          history: entriesRef.current.slice(-6).map((e) => ({ role: e.role, content: e.text.slice(0, 300) })),
         })
       );
+      clearWsKeepaliveTimer();
+      wsKeepaliveTimerRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          } catch {
+            // ignore
+          }
+        }
+      }, 14000);
     };
 
     ws.onmessage = (event) => {
@@ -882,6 +1100,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
       try {
         const msg = JSON.parse(event.data as string) as {
           ready?: boolean;
+          pong?: boolean;
           audio?: string;
           inputTranscript?: string;
           outputTranscript?: string;
@@ -890,10 +1109,13 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
           error?: string;
         };
 
+        if (msg.pong) return;
+
         if (msg.ready) {
           openedSuccessfully = true;
+          liveDropNoticeRef.current = false;
+          readyAtMs = Date.now();
           clearTimeout(connectTimeout);
-          reconnectAttemptsRef.current = 0;
           setError(null);
           setMode('live');
           modeRef.current = 'live';
@@ -913,6 +1135,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
 
           processor.onaudioprocess = (ev) => {
             if (isMutedRef.current || ws.readyState !== WebSocket.OPEN) {
+              bargeInSpeechFramesRef.current = 0;
               setMicLevel(0);
               return;
             }
@@ -924,6 +1147,22 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
               lastUiMeterUpdateRef.current = now;
               setMicLevel(Math.min(1, rms * 10));
             }
+
+            // Echo gate: prevent speaker bleed while Nova is speaking from falsely triggering barge-in & cutting off speech mid-sentence
+            const isOutputBusy = isAiSpeakingRef.current || now < vadCooldownUntilRef.current;
+            if (isOutputBusy) {
+              if (rms >= 0.055) {
+                bargeInSpeechFramesRef.current += 1;
+              } else {
+                bargeInSpeechFramesRef.current = 0;
+              }
+              if (bargeInSpeechFramesRef.current < 2) {
+                return;
+              }
+            } else {
+              bargeInSpeechFramesRef.current = 0;
+            }
+
             const base64 = float16kToPcmBase64(samples16k);
             ws.send(JSON.stringify({ audio: base64 }));
           };
@@ -932,7 +1171,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
           processor.connect(silentGain);
           silentGain.connect(inputCtx.destination);
         } else if (msg.audio) {
-          play24kChunk(msg.audio).catch(() => undefined);
+          play24kChunk(msg.audio, false).catch(() => undefined);
         } else if (msg.inputTranscript) {
           upsertDraftEntry('user', msg.inputTranscript);
         } else if (msg.outputTranscript) {
@@ -941,6 +1180,7 @@ export function LiveVoiceModal({ user, customInstruction, onClose, onAppendTurns
           stopPlaybackQueue();
           finalizeDraftIds();
         } else if (msg.turnComplete) {
+          play24kChunk(null, true).catch(() => undefined);
           finalizeDraftIds();
         } else if (msg.error) {
           clearTimeout(connectTimeout);

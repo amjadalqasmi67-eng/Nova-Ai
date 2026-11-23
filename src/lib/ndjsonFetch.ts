@@ -1,9 +1,21 @@
+export interface NdjsonStreamEvent<T = unknown> {
+  type?: string;
+  message?: string;
+  data?: T;
+  error?: string;
+  index?: number;
+  slide?: unknown;
+  deckTitle?: string;
+  deckSubtitle?: string;
+}
+
 export async function postNdjsonOrJson<T>(
   url: string,
   options: {
     headers: Record<string, string>;
     body: Record<string, unknown>;
     onStatus?: (message: string) => void;
+    onEvent?: (event: NdjsonStreamEvent<T>) => void;
   }
 ): Promise<T> {
   const response = await fetch(url, {
@@ -33,12 +45,8 @@ export async function postNdjsonOrJson<T>(
       if (trimmed.startsWith('<')) {
         throw new Error('انقطع الاتصال بالخادم أثناء المعالجة. يرجى المحاولة مرة أخرى.');
       }
-      const event = JSON.parse(trimmed) as {
-        type?: string;
-        message?: string;
-        data?: T;
-        error?: string;
-      };
+      const event = JSON.parse(trimmed) as NdjsonStreamEvent<T>;
+      options.onEvent?.(event);
       if (event.type === 'status' && typeof event.message === 'string') {
         options.onStatus?.(event.message);
       } else if (event.type === 'done' && event.data !== undefined) {

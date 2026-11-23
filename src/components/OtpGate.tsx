@@ -36,21 +36,27 @@ export function OtpGate({
       const idToken = await user.getIdToken();
       const res = await fetch('/api/auth/otp/request', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${idToken}`,
+          'X-Requested-With': 'NovaAI',
         },
         body: JSON.stringify({}),
       });
       const data = (await res.json()) as {
         sent?: boolean;
         alreadyVerified?: boolean;
+        otpToken?: string;
         emailMasked?: string;
         cooldownSec?: number;
         error?: string;
       };
 
       if (data.alreadyVerified) {
+        if (data.otpToken) {
+          setOtpSessionToken(data.otpToken);
+        }
         onVerified();
         return;
       }
@@ -106,9 +112,11 @@ export function OtpGate({
       const idToken = await user.getIdToken();
       const res = await fetch('/api/auth/otp/verify', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${idToken}`,
+          'X-Requested-With': 'NovaAI',
         },
         body: JSON.stringify({ code: cleaned }),
       });
@@ -145,7 +153,7 @@ export function OtpGate({
             أدخل رمز التأكيد المرسل لبريدك
           </h1>
           <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-            لحماية حسابك ومنع أي دخول غير مصرح به، أرسلنا رمزًا مكونًا من 6 أرقام (يُطلب مرة واحدة فقط عند تسجيل الدخول) إلى:
+            لحماية حسابك، أرسلنا رمز تحقق مكونًا من 6 أرقام (صالح لمدة 5 دقائق) إلى بريدك التالي. بعد إدخاله بنجاح، سيتذكر Nova AI هذا الجهاز والمتصفح لمدة 30 يومًا ما لم تسجّل الخروج يدويًا:
             <span dir="ltr" className="block font-mono font-semibold text-slate-900 dark:text-slate-200 mt-1">
               {emailMasked}
             </span>
