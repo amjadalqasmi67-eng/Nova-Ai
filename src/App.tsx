@@ -1,5 +1,15 @@
 import { useState, useEffect, FormEvent } from 'react';
-import { User, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import {
+  User,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
+  sendEmailVerification,
+  updateProfile,
+  signOut,
+} from 'firebase/auth';
 import {
   collection,
   doc,
@@ -28,12 +38,26 @@ import {
   ShieldCheck,
   GraduationCap,
   History,
+  RefreshCw,
+  LogOut,
+  MailCheck,
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react';
-import { auth, db, googleProvider, handleFirestoreError, OperationType } from './firebase';
+import {
+  auth,
+  db,
+  googleProvider,
+  microsoftProvider,
+  appleProvider,
+  handleFirestoreError,
+  OperationType,
+} from './firebase';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { StarfieldCanvas } from './components/StarfieldCanvas';
 import { NovaStarLogo } from './components/NovaStarLogo';
-import { LoginGate } from './components/LoginGate';
+import { LoginGate, AuthMethod } from './components/LoginGate';
+import { isValidEmailFormat, mapFirebaseAuthError } from './lib/authErrors';
 import { OtpGate } from './components/OtpGate';
 import { ChatWorkspace } from './components/ChatWorkspace';
 import { PresentationStudio } from './components/PresentationStudio';
@@ -116,8 +140,15 @@ function getInitialShareId(): string | null {
 function NovaApplication() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [authLoading, setAuthLoading] = useState(false);
+  const [loadingMethod, setLoadingMethod] = useState<AuthMethod | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [isEmailVerified, setIsEmailVerified] = useState(false);
+  const [verifyingEmailLink, setVerifyingEmailLink] = useState(false);
+  const [resendingVerification, setResendingVerification] = useState(false);
+  const [emailVerifyFeedback, setEmailVerifyFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
   const [otpStatus, setOtpStatus] = useState<'idle' | 'required' | 'verified'>('idle');
   const [otpEmailMasked, setOtpEmailMasked] = useState('');
   const [otpCooldownSec, setOtpCooldownSec] = useState(0);
@@ -154,79 +185,99 @@ function NovaApplication() {
     applyThemePreferences(themeMode, accentColor, backgroundStyle, fontColor);
   }, [themeMode, accentColor, backgroundStyle, fontColor]);
 
+  const syncVerifiedUserProfile = async (firebaseUser: User) => {
+    const userPath = `users/${firebaseUser.uid}`;
+    try {
+      const snap = await getDoc(doc(db, userPath));
+      if (!snap.exists()) {
+        const initialDisplayName = (
+          firebaseUser.displayName ||
+          firebaseUser.email?.split('@')[0] ||
+          'Nova User'
+        ).slice(0, 120);
+        await setDoc(doc(db, userPath), {
+          uid: firebaseUser.uid,
+          displayName: initialDisplayName,
+          email: (firebaseUser.email || 'user@nova.ai').slice(0, 200),
+          customInstruction: '',
+          accentColor,
+          themeMode,
+          backgroundStyle,
+          fontColor,
+          avatarDataUrl: '',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        setCustomDisplayName(initialDisplayName);
+        setCustomInstruction('');
+        setCustomAvatarUrl('');
+      } else {
+        const data = snap.data();
+        const storedName =
+          typeof data.displayName === 'string' && data.displayName.trim()
+            ? data.displayName.trim().slice(0, 120)
+            : (firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Nova User').slice(0, 120);
+        setCustomDisplayName(storedName);
+        setCustomInstruction(String(data.customInstruction || ''));
+        setCustomAvatarUrl(String(data.avatarDataUrl || ''));
+        if (isValidAccentColor(data.accentColor)) {
+          setAccentColor(data.accentColor);
+        }
+        if (data.themeMode === 'dark' || data.themeMode === 'light') {
+          setThemeMode(data.themeMode);
+        }
+        if (isValidBackgroundStyle(data.backgroundStyle)) {
+          setBackgroundStyle(data.backgroundStyle);
+        }
+        if (isValidFontColor(data.fontColor)) {
+          setFontColor(data.fontColor);
+        }
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, userPath);
+    }
+
+    // Record verified session visit once per browser session per day for owner analytics
+    const now = new Date();
+    const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+      now.getDate()
+    ).padStart(2, '0')}`;
+    const visitFlagKey = `nova_visit_${firebaseUser.uid}_${dateKey}`;
+    try {
+      if (!sessionStorage.getItem(visitFlagKey)) {
+        const width = window.innerWidth;
+        const deviceType: 'mobile' | 'tablet' | 'desktop' =
+          width < 640 ? 'mobile' : width < 1024 ? 'tablet' : 'desktop';
+        await setDoc(doc(db, 'visitLogs', crypto.randomUUID()), {
+          userId: firebaseUser.uid,
+          dateKey,
+          deviceType,
+          createdAt: serverTimestamp(),
+        });
+        sessionStorage.setItem(visitFlagKey, '1');
+      }
+    } catch {
+      // Non-blocking analytics log
+    }
+  };
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
-        const userPath = `users/${firebaseUser.uid}`;
-        try {
-          const snap = await getDoc(doc(db, userPath));
-          if (!snap.exists()) {
-            const initialDisplayName = (firebaseUser.displayName || 'Nova User').slice(0, 120);
-            await setDoc(doc(db, userPath), {
-              uid: firebaseUser.uid,
-              displayName: initialDisplayName,
-              email: (firebaseUser.email || 'user@nova.ai').slice(0, 200),
-              customInstruction: '',
-              accentColor,
-              themeMode,
-              backgroundStyle,
-              fontColor,
-              avatarDataUrl: '',
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-            setCustomDisplayName(initialDisplayName);
-            setCustomInstruction('');
-            setCustomAvatarUrl('');
-          } else {
-            const data = snap.data();
-            const storedName =
-              typeof data.displayName === 'string' && data.displayName.trim()
-                ? data.displayName.trim().slice(0, 120)
-                : (firebaseUser.displayName || 'Nova User').slice(0, 120);
-            setCustomDisplayName(storedName);
-            setCustomInstruction(String(data.customInstruction || ''));
-            setCustomAvatarUrl(String(data.avatarDataUrl || ''));
-            if (isValidAccentColor(data.accentColor)) {
-              setAccentColor(data.accentColor);
-            }
-            if (data.themeMode === 'dark' || data.themeMode === 'light') {
-              setThemeMode(data.themeMode);
-            }
-            if (isValidBackgroundStyle(data.backgroundStyle)) {
-              setBackgroundStyle(data.backgroundStyle);
-            }
-            if (isValidFontColor(data.fontColor)) {
-              setFontColor(data.fontColor);
-            }
-          }
-        } catch (err) {
-          handleFirestoreError(err, OperationType.GET, userPath);
-        }
+        const verified = Boolean(firebaseUser.emailVerified && firebaseUser.email);
+        setIsEmailVerified(verified);
+        setEmailVerifyFeedback(null);
 
-        // Record verified session visit once per browser session per day for owner analytics
-        if (firebaseUser.emailVerified) {
-          const now = new Date();
-          const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
-            now.getDate()
-          ).padStart(2, '0')}`;
-          const visitFlagKey = `nova_visit_${firebaseUser.uid}_${dateKey}`;
-          try {
-            if (!sessionStorage.getItem(visitFlagKey)) {
-              const width = window.innerWidth;
-              const deviceType: 'mobile' | 'tablet' | 'desktop' =
-                width < 640 ? 'mobile' : width < 1024 ? 'tablet' : 'desktop';
-              await setDoc(doc(db, 'visitLogs', crypto.randomUUID()), {
-                userId: firebaseUser.uid,
-                dateKey,
-                deviceType,
-                createdAt: serverTimestamp(),
-              });
-              sessionStorage.setItem(visitFlagKey, '1');
-            }
-          } catch {
-            // Non-blocking analytics log
-          }
+        if (verified) {
+          await syncVerifiedUserProfile(firebaseUser);
+        } else {
+          // Firestore security rules require request.auth.token.email_verified == true;
+          // defer profile creation/read until user verifies their email link.
+          setCustomDisplayName(
+            (firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Nova User').slice(0, 120)
+          );
+          setCustomInstruction('');
+          setCustomAvatarUrl('');
         }
 
         try {
@@ -309,6 +360,8 @@ function NovaApplication() {
         setOtpEmailMasked('');
         setOtpCooldownSec(0);
         setCustomDisplayName('');
+        setIsEmailVerified(false);
+        setEmailVerifyFeedback(null);
       }
       setUser(firebaseUser);
       setAuthReady(true);
@@ -347,23 +400,143 @@ function NovaApplication() {
     return () => unsubscribe();
   }, [isOwner, activeTab]);
 
-  const handleSignIn = async () => {
-    setAuthLoading(true);
+  const handleEmailSignIn = async (email: string, password: string) => {
+    const cleanEmail = email.trim();
+    if (!isValidEmailFormat(cleanEmail)) {
+      setAuthError('يرجى إدخال بريد إلكتروني صحيح.');
+      return;
+    }
+    if (!password) {
+      setAuthError('يرجى إدخال كلمة المرور.');
+      return;
+    }
+
+    setLoadingMethod('email');
     setAuthError(null);
     try {
-      googleProvider.setCustomParameters({ prompt: 'select_account' });
-      await signInWithPopup(auth, googleProvider);
+      await signInWithEmailAndPassword(auth, cleanEmail, password);
     } catch (err) {
-      const message = err instanceof Error ? err.message : '';
-      if (message.includes('popup-closed-by-user')) {
-        setAuthError('تم إغلاق نافذة تسجيل الدخول قبل إتمام التحقق.');
-      } else if (message.includes('popup-blocked')) {
-        setAuthError('حظر المتصفح نافذة تسجيل الدخول. يرجى السماح بالنوافذ المنبثقة ثم المحاولة مجددًا.');
-      } else {
-        setAuthError('تعذر إتمام تسجيل الدخول حاليًا. يرجى المحاولة مجددًا.');
-      }
+      setAuthError(mapFirebaseAuthError(err, 'login'));
     } finally {
-      setAuthLoading(false);
+      setLoadingMethod(null);
+    }
+  };
+
+  const handleEmailSignUp = async (email: string, password: string, fullName?: string) => {
+    const cleanEmail = email.trim();
+    if (!isValidEmailFormat(cleanEmail)) {
+      setAuthError('يرجى إدخال بريد إلكتروني صحيح.');
+      return;
+    }
+    if (password.length < 6) {
+      setAuthError('كلمة المرور يجب أن تتكون من 6 أحرف أو أرقام على الأقل.');
+      return;
+    }
+
+    setLoadingMethod('email');
+    setAuthError(null);
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      const cleanName = fullName ? sanitizeUserText(fullName, 80, false) : '';
+      if (cleanName) {
+        await updateProfile(cred.user, { displayName: cleanName }).catch(() => undefined);
+        setCustomDisplayName(cleanName);
+      }
+      await sendEmailVerification(cred.user).catch(() => undefined);
+    } catch (err) {
+      setAuthError(mapFirebaseAuthError(err, 'signup'));
+    } finally {
+      setLoadingMethod(null);
+    }
+  };
+
+  const handleResetPassword = async (email: string): Promise<boolean> => {
+    const cleanEmail = email.trim();
+    if (!isValidEmailFormat(cleanEmail)) {
+      setAuthError('يرجى إدخال البريد الإلكتروني الصحيح لإرسال رابط الاستعادة.');
+      return false;
+    }
+
+    setLoadingMethod('email');
+    setAuthError(null);
+    try {
+      await sendPasswordResetEmail(auth, cleanEmail);
+      return true;
+    } catch (err) {
+      setAuthError(mapFirebaseAuthError(err, 'reset'));
+      return false;
+    } finally {
+      setLoadingMethod(null);
+    }
+  };
+
+  const handleProviderSignIn = async (provider: 'google' | 'microsoft' | 'apple') => {
+    setLoadingMethod(provider);
+    setAuthError(null);
+    try {
+      if (provider === 'google') {
+        googleProvider.setCustomParameters({ prompt: 'select_account' });
+        await signInWithPopup(auth, googleProvider);
+      } else if (provider === 'microsoft') {
+        microsoftProvider.setCustomParameters({ prompt: 'select_account' });
+        await signInWithPopup(auth, microsoftProvider);
+      } else {
+        appleProvider.addScope('email');
+        appleProvider.addScope('name');
+        await signInWithPopup(auth, appleProvider);
+      }
+    } catch (err) {
+      setAuthError(mapFirebaseAuthError(err, 'oauth'));
+    } finally {
+      setLoadingMethod(null);
+    }
+  };
+
+  const handleCheckEmailVerified = async () => {
+    const current = auth.currentUser;
+    if (!current || verifyingEmailLink) return;
+    setVerifyingEmailLink(true);
+    setEmailVerifyFeedback(null);
+    try {
+      await current.reload();
+      await current.getIdToken(true);
+      if (current.emailVerified && current.email) {
+        await syncVerifiedUserProfile(current);
+        setIsEmailVerified(true);
+      } else {
+        setEmailVerifyFeedback({
+          type: 'error',
+          text: 'لم يتم تأكيد البريد الإلكتروني بعد. افتح رسالة التفعيل في بريدك واضغط على الرابط ثم أعد المحاولة.',
+        });
+      }
+    } catch {
+      setEmailVerifyFeedback({
+        type: 'error',
+        text: 'تعذر التحقق من حالة التفعيل حاليًا. حاول مرة أخرى بعد لحظات.',
+      });
+    } finally {
+      setVerifyingEmailLink(false);
+    }
+  };
+
+  const handleResendVerificationEmail = async () => {
+    const current = auth.currentUser;
+    if (!current || resendingVerification) return;
+    setResendingVerification(true);
+    setEmailVerifyFeedback(null);
+    try {
+      await sendEmailVerification(current);
+      setEmailVerifyFeedback({
+        type: 'success',
+        text: 'تم إعادة إرسال رابط تفعيل البريد الإلكتروني. تفقد صندوق الوارد أو الرسائل غير المرغوب فيها.',
+      });
+    } catch (err) {
+      setEmailVerifyFeedback({
+        type: 'error',
+        text: mapFirebaseAuthError(err, 'reset'),
+      });
+    } finally {
+      setResendingVerification(false);
     }
   };
 
@@ -642,9 +815,13 @@ function NovaApplication() {
           </div>
         ) : (
           <LoginGate
-            onSignIn={handleSignIn}
-            isLoading={authLoading}
+            onEmailSignIn={handleEmailSignIn}
+            onEmailSignUp={handleEmailSignUp}
+            onResetPassword={handleResetPassword}
+            onProviderSignIn={handleProviderSignIn}
+            loadingMethod={loadingMethod}
             error={authError}
+            onClearError={() => setAuthError(null)}
             onOpenPrivacy={openGuestPrivacy}
           />
         )
@@ -656,6 +833,78 @@ function NovaApplication() {
           onVerified={() => setOtpStatus('verified')}
           onSignOut={handleSignOut}
         />
+      ) : !isEmailVerified ? (
+        <div dir="rtl" className="relative z-20 min-h-[100dvh] flex items-center justify-center p-4 sm:p-6">
+          <div className="w-full max-w-md rounded-3xl bg-white/95 dark:bg-[#0B1122]/94 border border-slate-200/90 dark:border-white/12 p-6 sm:p-8 text-center shadow-2xl space-y-5 backdrop-blur-xl">
+            <div className="flex justify-center">
+              <div className="relative inline-flex items-center justify-center">
+                <NovaStarLogo size="md" />
+                <span className="absolute -bottom-1 -left-1 w-6 h-6 rounded-full bg-emerald-500 text-white flex items-center justify-center shadow">
+                  <MailCheck className="w-3.5 h-3.5" />
+                </span>
+              </div>
+            </div>
+
+            <div>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white">تأكيد البريد الإلكتروني</h2>
+              <p className="mt-2 text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                أرسلنا رابط تفعيل إلى بريدك الإلكتروني{' '}
+                <span dir="ltr" className="font-mono font-semibold text-slate-900 dark:text-white">
+                  {user.email}
+                </span>
+                . اضغط على الرابط داخل الرسالة ثم اضغط زر المتابعة أدناه لحماية بياناتك.
+              </p>
+            </div>
+
+            {emailVerifyFeedback && (
+              <div
+                role={emailVerifyFeedback.type === 'error' ? 'alert' : 'status'}
+                className={`flex items-start gap-2.5 rounded-2xl border px-3.5 py-3 text-xs text-right leading-relaxed ${
+                  emailVerifyFeedback.type === 'error'
+                    ? 'bg-rose-500/10 border-rose-500/30 text-rose-700 dark:text-rose-200'
+                    : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-200'
+                }`}
+              >
+                {emailVerifyFeedback.type === 'error' ? (
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-500" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-500" />
+                )}
+                <span>{emailVerifyFeedback.text}</span>
+              </div>
+            )}
+
+            <div className="space-y-2.5">
+              <button
+                type="button"
+                disabled={verifyingEmailLink}
+                onClick={handleCheckEmailVerified}
+                className="accent-btn w-full min-h-[48px] rounded-xl text-white text-sm font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw className={`w-4 h-4 ${verifyingEmailLink ? 'animate-spin' : ''}`} />
+                <span>{verifyingEmailLink ? 'جاري التحقق...' : 'تحقّقت من البريد — المتابعة إلى Nova AI'}</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={resendingVerification}
+                onClick={handleResendVerificationEmail}
+                className="w-full min-h-[44px] rounded-xl border border-slate-200 dark:border-white/14 bg-slate-50 dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer disabled:opacity-50 transition-colors"
+              >
+                {resendingVerification ? 'جاري إعادة الإرسال...' : 'إعادة إرسال رابط التفعيل'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleSignOut}
+                className="w-full min-h-[40px] inline-flex items-center justify-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>تسجيل الخروج أو تجربة بريد آخر</span>
+              </button>
+            </div>
+          </div>
+        </div>
       ) : isScreenLocked && savedPinHash ? (
         <div className="relative z-20 min-h-[100dvh] flex items-center justify-center p-4 sm:p-6">
           <form
