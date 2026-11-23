@@ -19,12 +19,25 @@ export function cleanTextForSpeech(content: string): string {
   return content
     .replace(/https?:\/\/\S+/g, ' ')
     .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/[*#`>_~[\](){}|\\]/g, ' ')
     .replace(/\bNova AI\b/gi, 'نوفا')
+    .replace(/[*#`>_~[\](){}|\\]/g, ' ')
+    .replace(/\s*&\s*/g, ' و ')
     .replace(/%/g, ' بالمئة ')
+    .replace(/\r?\n+/g, '، ')
+    .replace(/\s*([،؛.؟!])\s*/g, '$1 ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 1500);
+}
+
+export function pickBestArabicBrowserVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | undefined {
+  const arVoices = voices.filter((v) => v.lang.toLowerCase().startsWith('ar'));
+  if (arVoices.length === 0) return undefined;
+  return (
+    arVoices.find((v) => /natural|neural|google|online|enhanced/i.test(v.name)) ||
+    arVoices.find((v) => !v.localService) ||
+    arVoices[0]
+  );
 }
 
 export function createVoiceReader(): VoiceReaderController {
@@ -56,7 +69,7 @@ export function createVoiceReader(): VoiceReaderController {
       const speakWithBrowserFallback = (): boolean => {
         if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
         const voices = window.speechSynthesis.getVoices();
-        const arabicVoice = voices.find((v) => v.lang.toLowerCase().startsWith('ar'));
+        const arabicVoice = pickBestArabicBrowserVoice(voices);
         const clean = cleanTextForSpeech(text);
         if (!clean || (!arabicVoice && voices.length > 0)) return false;
         const utterance = new SpeechSynthesisUtterance(clean);
@@ -91,7 +104,7 @@ export function createVoiceReader(): VoiceReaderController {
             Authorization: `Bearer ${idToken}`,
             ...getOtpHeaders(),
           },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, voiceName: 'Zephyr' }),
         });
         const rawText = await res.text();
         if (rawText.trimStart().startsWith('<')) {

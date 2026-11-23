@@ -45,6 +45,8 @@ import { CameraCaptureModal } from './CameraCaptureModal';
 import { LiveVoiceModal } from './LiveVoiceModal';
 import { getOtpHeaders } from '../lib/otpSession';
 import { sanitizeUserText } from '../lib/sanitize';
+import { primeOutputAudioContext } from '../lib/audioUnlock';
+import { cleanTextForSpeech, pickBestArabicBrowserVoice } from '../lib/voiceReader';
 
 interface Conversation {
   id: string;
@@ -282,16 +284,9 @@ export function ChatWorkspace({
     const speakWithBrowserFallback = (): boolean => {
       if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
       const voices = window.speechSynthesis.getVoices();
-      const arabicVoice = voices.find((v) => v.lang.toLowerCase().startsWith('ar'));
+      const arabicVoice = pickBestArabicBrowserVoice(voices);
       if (!arabicVoice) return false;
-      const clean = content
-        .replace(/https?:\/\/\S+/g, ' ')
-        .replace(/[*#`>_~[\](){}|\\]/g, ' ')
-        .replace(/\bNova AI\b/gi, 'نوفا')
-        .replace(/%/g, ' بالمئة ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 1500);
+      const clean = cleanTextForSpeech(content);
       if (!clean) return false;
       const utterance = new SpeechSynthesisUtterance(clean);
       utterance.voice = arabicVoice;
@@ -314,7 +309,7 @@ export function ChatWorkspace({
           Authorization: `Bearer ${idToken}`,
           ...getOtpHeaders(),
         },
-        body: JSON.stringify({ text: content }),
+        body: JSON.stringify({ text: content, voiceName: 'Zephyr' }),
       });
       const rawText = await res.text();
       if (rawText.trimStart().startsWith('<')) {
@@ -991,7 +986,10 @@ export function ChatWorkspace({
             <div className="flex flex-wrap items-center gap-1.5">
               <button
                 type="button"
-                onClick={() => setVoiceModalOpen(true)}
+                onClick={() => {
+                  primeOutputAudioContext();
+                  setVoiceModalOpen(true);
+                }}
                 className="accent-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
               >
                 <Mic className="w-3.5 h-3.5" />
@@ -1345,7 +1343,10 @@ export function ChatWorkspace({
             </button>
             <button
               type="button"
-              onClick={() => setVoiceModalOpen(true)}
+              onClick={() => {
+                primeOutputAudioContext();
+                setVoiceModalOpen(true);
+              }}
               disabled={isLoadingReply}
               aria-label="التحدث صوتيًا"
               title="محادثة صوتية مباشرة"

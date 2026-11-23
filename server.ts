@@ -1904,78 +1904,103 @@ export function createNovaApiApp(): express.Express {
     }
   });
 
+  const ALLOWED_VOICE_NAMES = ['Zephyr', 'Kore', 'Puck', 'Charon', 'Fenrir'] as const;
+
+  const prepareArabicSpeechText = (raw: string | undefined, maxLen: number): string => {
+    return sanitizeTextInput(raw, Math.max(maxLen + 500, 2500))
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/\bNova AI\b/gi, 'نوفا')
+      .replace(/[*#`>_~[\](){}|\\]/g, ' ')
+      .replace(/\s*&\s*/g, ' و ')
+      .replace(/%/g, ' بالمئة ')
+      .replace(/\r?\n+/g, '، ')
+      .replace(/\s*([،؛.؟!])\s*/g, '$1 ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, maxLen);
+  };
+
+  const generateNaturalArabicTts = async (
+    ai: GoogleGenAI,
+    cleanText: string,
+    voiceName: string | undefined,
+    timeoutMs = 24000
+  ): Promise<{ audioBase64: string | null; lastError: unknown }> => {
+    const chosenVoice =
+      typeof voiceName === 'string' && (ALLOWED_VOICE_NAMES as readonly string[]).includes(voiceName)
+        ? voiceName
+        : 'Zephyr';
+
+    let base64Audio: string | null = null;
+    let lastError: unknown = null;
+
+    // Prefer flagship gemini-3.8-flash-tts first for the most natural, expressive human Arabic voice
+    for (const ttsModel of ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts']) {
+      try {
+        const response = await ai.models.generateContent({
+          model: ttsModel,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: cleanText,
+                  speechMetadata: {
+                    style:
+                      'Warm, expressive, natural human Arabic conversational speaker with fluent native pronunciation, smooth phrasing, gentle natural cadence, and zero robotic monotone',
+                  },
+                },
+              ],
+            },
+          ],
+          config: {
+            abortSignal: AbortSignal.timeout(timeoutMs),
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: chosenVoice },
+              },
+            },
+          },
+        });
+
+        const audioPart = response.candidates?.[0]?.content?.parts?.find((p) => Boolean(p.inlineData?.data));
+        base64Audio = audioPart?.inlineData?.data || null;
+        if (base64Audio) break;
+      } catch (ttsErr) {
+        lastError = ttsErr;
+        console.warn(`[Nova AI TTS ${ttsModel} fallback]:`, ttsErr);
+      }
+    }
+
+    return { audioBase64: base64Audio, lastError };
+  };
+
   // 3. Text-to-Speech Endpoint for Listening to Nova AI Replies
   app.post('/api/nova/tts', async (req: AuthedRequest, res: Response) => {
     try {
-      const { text, voiceName = 'Kore' } = req.body as {
+      const { text, voiceName = 'Zephyr' } = req.body as {
         text?: string;
         voiceName?: string;
       };
 
-      const cleanText = sanitizeTextInput(text, 2500)
-        .replace(/https?:\/\/\S+/g, ' ')
-        .replace(/```[\s\S]*?```/g, ' ')
-        .replace(/[*#`>_~[\](){}|\\]/g, ' ')
-        .replace(/\bNova AI\b/gi, 'نوفا')
-        .replace(/%/g, ' بالمئة ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 1500);
+      const cleanText = prepareArabicSpeechText(text, 1500);
       if (!cleanText) {
         res.status(400).json({ error: 'النص فارغ ولا يمكن قراءته.' });
         return;
       }
 
       const ai = getAiClient();
-      const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-      const chosenVoice = typeof voiceName === 'string' && allowedVoices.includes(voiceName) ? voiceName : 'Kore';
+      const { audioBase64, lastError } = await generateNaturalArabicTts(ai, cleanText, voiceName, 24000);
 
-      let base64Audio: string | null = null;
-      let lastTtsError: unknown;
-      for (const ttsModel of ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']) {
-        try {
-          const response = await ai.models.generateContent({
-            model: ttsModel,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: cleanText,
-                    speechMetadata: {
-                      style: 'Clear, fluent, natural Modern Standard Arabic speaker with accurate Arabic pronunciation',
-                    },
-                  },
-                ],
-              },
-            ],
-            config: {
-              abortSignal: AbortSignal.timeout(22000),
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: chosenVoice },
-                },
-              },
-            },
-          });
-
-          const audioPart = response.candidates?.[0]?.content?.parts?.find((p) => Boolean(p.inlineData?.data));
-          base64Audio = audioPart?.inlineData?.data || null;
-          if (base64Audio) break;
-        } catch (ttsErr) {
-          lastTtsError = ttsErr;
-          console.warn(`[Nova AI TTS ${ttsModel} fallback]:`, ttsErr);
-        }
-      }
-
-      if (!base64Audio) {
-        if (lastTtsError) throw lastTtsError;
+      if (!audioBase64) {
+        if (lastError) throw lastError;
         res.status(502).json({ error: 'تعذر توليد الصوت حاليًا.' });
         return;
       }
 
-      res.json({ audioBase64: base64Audio, mimeType: 'audio/wav' });
+      res.json({ audioBase64, mimeType: 'audio/wav' });
     } catch (err) {
       console.error('[Nova AI TTS Error]:', err);
       const mapped = mapGeminiError(err);
@@ -1983,10 +2008,10 @@ export function createNovaApiApp(): express.Express {
     }
   });
 
-  // 4. Turn-Based Voice Conversation Fallback Endpoint (Audio -> Transcript + Reply + Spoken Audio)
+  // 4. Turn-Based Voice Conversation Endpoint (Hands-Free Auto-VAD Audio -> Transcript + Reply + Human Audio)
   app.post('/api/nova/voice-turn', async (req: AuthedRequest, res: Response) => {
     try {
-      const { audioBase64, mimeType = 'audio/webm', history = [], customInstruction, voiceName = 'Kore' } = req.body as {
+      const { audioBase64, mimeType = 'audio/wav', history = [], customInstruction, voiceName = 'Zephyr' } = req.body as {
         audioBase64?: string;
         mimeType?: string;
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -1995,7 +2020,7 @@ export function createNovaApiApp(): express.Express {
       };
 
       const rawBaseMime =
-        typeof mimeType === 'string' ? mimeType.split(';')[0].trim().toLowerCase() : 'audio/webm';
+        typeof mimeType === 'string' ? mimeType.split(';')[0].trim().toLowerCase() : 'audio/wav';
       const normalizedAudioMime = rawBaseMime === 'audio/x-m4a' ? 'audio/mp4' : rawBaseMime;
       const ALLOWED_AUDIO_MIMES = new Set([
         'audio/webm',
@@ -2021,17 +2046,19 @@ export function createNovaApiApp(): express.Express {
         ? history
             .filter((h) => h && typeof h.content === 'string')
             .slice(-6)
-            .map((h) => `${h.role === 'assistant' ? 'Nova AI' : 'المستخدم'}: ${sanitizeTextInput(h.content, 600)}`)
+            .map((h) => `${h.role === 'assistant' ? 'نوفا' : 'المستخدم'}: ${sanitizeTextInput(h.content, 600)}`)
             .join('\n')
         : '';
 
       const cleanCustomInstruction = sanitizeTextInput(customInstruction, 1000);
       const systemInstruction = [
-        'أنت Nova AI في محادثة صوتية طبيعية وودية باللغة العربية فقط.',
+        'أنت «نوفا» في محادثة صوتية إنسانية دافئة وطبيعية باللغة العربية فقط.',
         'قواعد صارمة:',
-        '- استمع إلى التسجيل الصوتي للمستخدم، واكتب النص العربي الدقيق لما قاله في حقل userTranscript.',
-        '- أجب عليه باللغة العربية الفصحى الواضحة والسليمة فقط في حقل replyText.',
-        '- ممنوع تمامًا خلط الإنجليزية أو كتابة كلمات أجنبية أو رموز برمجية أو نجوم تنسيق داخل replyText إلا إذا طلب المستخدم ترجمة أو كلمة أجنبية صراحةً؛ اكتب الأرقام والمصطلحات بنطق عربي واضح ومفهوم.',
+        '- استمع بدقة إلى التسجيل الصوتي للمستخدم، واكتب النص العربي الدقيق لما قاله في حقل userTranscript.',
+        '- إذا كان التسجيل مجرد صمت أو ضوضاء عابرة بلا أي كلام بشري واضح، اجعل noSpeechDetected يساوي true واجعل userTranscript وreplyText فارغين.',
+        '- إذا تحدّث المستخدم (مثل «السلام عليكم» أو أي سؤال)، اجعل noSpeechDetected يساوي false وأجب عليه بلغة عربية طبيعية سلسة ودافئة وواضحة تمامًا كمتحدث بشري في حقل replyText.',
+        '- عند رد التحية مثل «السلام عليكم»، أجب بدفء ووضوح مثل: «وعليكم السلام ورحمة الله وبركاته، أهلاً بك! كيف أقدر أساعدك اليوم؟».',
+        '- صِغ replyText للنطق الصوتي السلس: استخدم الفواصل العربية «،» والنقاط «.» لوقفات تنفس طبيعية، واكتب الأرقام البسيطة بالكلمات العربية، وتجنّب تمامًا النجوم أو الرموز أو التعداد النقطي أو الكلمات الإنجليزية غير الضرورية.',
         cleanCustomInstruction ? `تعليمات المستخدم الشخصية:\n${cleanCustomInstruction}` : '',
       ]
         .filter(Boolean)
@@ -2048,6 +2075,7 @@ export function createNovaApiApp(): express.Express {
 
       let userTranscript = '';
       let replyText = '';
+      let noSpeechDetected = false;
       let lastError: unknown;
 
       for (const item of turnModels) {
@@ -2070,6 +2098,7 @@ export function createNovaApiApp(): express.Express {
                 properties: {
                   userTranscript: { type: Type.STRING },
                   replyText: { type: Type.STRING },
+                  noSpeechDetected: { type: Type.BOOLEAN },
                 },
                 required: ['userTranscript', 'replyText'],
               },
@@ -2078,7 +2107,17 @@ export function createNovaApiApp(): express.Express {
 
           const raw = extractGeminiText(response);
           if (!raw) continue;
-          const parsed = JSON.parse(raw) as { userTranscript?: string; replyText?: string };
+          const parsed = JSON.parse(raw) as {
+            userTranscript?: string;
+            replyText?: string;
+            noSpeechDetected?: boolean;
+          };
+          if (parsed.noSpeechDetected && !(parsed.userTranscript || '').trim()) {
+            noSpeechDetected = true;
+            userTranscript = '';
+            replyText = '';
+            break;
+          }
           if (parsed.replyText?.trim()) {
             userTranscript = (parsed.userTranscript || '').trim();
             replyText = parsed.replyText.trim();
@@ -2089,60 +2128,30 @@ export function createNovaApiApp(): express.Express {
         }
       }
 
+      if (noSpeechDetected) {
+        res.json({
+          userTranscript: '',
+          replyText: '',
+          noSpeechDetected: true,
+          audioBase64: null,
+          mimeType: null,
+        });
+        return;
+      }
+
       if (!replyText) {
         throw lastError ?? new Error('EMPTY_VOICE_REPLY');
       }
 
-      let audioReplyBase64: string | null = null;
-      const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-      const chosenVoice = typeof voiceName === 'string' && allowedVoices.includes(voiceName) ? voiceName : 'Kore';
-      const cleanSpeechText = replyText
-        .replace(/https?:\/\/\S+/g, ' ')
-        .replace(/[*#`>_~[\](){}|\\]/g, ' ')
-        .replace(/\bNova AI\b/gi, 'نوفا')
-        .replace(/%/g, ' بالمئة ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 1000);
-
-      for (const ttsModel of ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']) {
-        try {
-          const ttsRes = await ai.models.generateContent({
-            model: ttsModel,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: cleanSpeechText,
-                    speechMetadata: {
-                      style: 'Clear, natural, fluent Modern Standard Arabic speaker with warm, accurate pronunciation',
-                    },
-                  },
-                ],
-              },
-            ],
-            config: {
-              abortSignal: AbortSignal.timeout(20000),
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: chosenVoice },
-                },
-              },
-            },
-          });
-          const audioPart = ttsRes.candidates?.[0]?.content?.parts?.find((p) => Boolean(p.inlineData?.data));
-          audioReplyBase64 = audioPart?.inlineData?.data || null;
-          if (audioReplyBase64) break;
-        } catch (ttsErr) {
-          console.warn(`[Nova AI Voice Turn TTS ${ttsModel} fallback]:`, ttsErr);
-        }
-      }
+      const cleanSpeechText = prepareArabicSpeechText(replyText, 1000);
+      const { audioBase64: audioReplyBase64 } = cleanSpeechText
+        ? await generateNaturalArabicTts(ai, cleanSpeechText, voiceName, 22000)
+        : { audioBase64: null };
 
       res.json({
         userTranscript,
         replyText,
+        noSpeechDetected: false,
         audioBase64: audioReplyBase64,
         mimeType: audioReplyBase64 ? 'audio/wav' : null,
       });
@@ -3493,19 +3502,28 @@ async function startServer() {
         wsActiveByUid.set(uid, uidSockets + 1);
 
         const ai = getAiClient();
-        const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-        const chosenVoice = typeof voiceParam === 'string' && allowedVoices.includes(voiceParam) ? voiceParam : 'Kore';
+        const allowedVoices = ['Zephyr', 'Kore', 'Puck', 'Charon', 'Fenrir'];
+        const chosenVoice = typeof voiceParam === 'string' && allowedVoices.includes(voiceParam) ? voiceParam : 'Zephyr';
         const cleanInstruction = sanitizeTextInput(customInstruction, 600);
 
         const systemInstruction = [
-          'أنت Nova AI في محادثة صوتية مباشرة بالوقت الفعلي.',
-          'التزم بالتحدث باللغة العربية الفصحى الواضحة والسليمة فقط في جميع ردودك الصوتية، وبنطق عربي طبيعي ودافئ ومفهوم.',
-          'لا تتحول إلى اللغة الإنجليزية أو أي لغة أخرى ولا تخلط كلمات أجنبية غير ضرورية ما لم يطلب المستخدم ذلك صراحةً.',
-          'اجعل ردودك الصوتية مركزة ومفيدة ومباشرة دون إطالة مملة، وإذا سألك المستخدم سؤالاً فأعطه الإجابة الصحيحة بوضوح.',
+          'أنت «نوفا» في محادثة صوتية مباشرة بالوقت الفعلي.',
+          'تحدّث باللغة العربية الواضحة والسليمة بنبرة إنسانية دافئة وطبيعية وسلسة تمامًا كمتحدث عربي حقيقي، وتجنّب تمامًا النبرة الآلية أو التقطيع.',
+          'عند سماع تحية مثل «السلام عليكم» رحّب بالمستخدم فورًا بدفء ووضوح مثل: «وعليكم السلام ورحمة الله وبركاته، أهلاً بك! كيف أساعدك اليوم؟».',
+          'لا تتحول إلى اللغة الإنجليزية ولا تخلط كلمات أجنبية غير ضرورية ما لم يطلب المستخدم ذلك صراحةً، ولا تنطق رموزًا أو نجوم تنسيق.',
+          'اجعل ردودك الصوتية مركزة ومفيدة ومباشرة بإيقاع كلام طبيعي مريح دون إطالة مملة.',
           cleanInstruction ? `تعليمات المستخدم الشخصية:\n${cleanInstruction}` : '',
         ]
           .filter(Boolean)
           .join('\n');
+
+        let readySent = false;
+        const sendReadySignal = () => {
+          if (!readySent && !isClosed && clientWs.readyState === clientWs.OPEN) {
+            readySent = true;
+            clientWs.send(JSON.stringify({ ready: true }));
+          }
+        };
 
         liveSession = await ai.live.connect({
           model: 'gemini-3.8-live',
@@ -3522,9 +3540,7 @@ async function startServer() {
           },
           callbacks: {
             onopen: () => {
-              if (!isClosed && clientWs.readyState === clientWs.OPEN) {
-                clientWs.send(JSON.stringify({ ready: true }));
-              }
+              sendReadySignal();
             },
             onmessage: (message: LiveServerMessage) => {
               if (isClosed || clientWs.readyState !== clientWs.OPEN) return;
@@ -3563,12 +3579,13 @@ async function startServer() {
             onclose: (ev) => {
               const reason = (ev as { reason?: string })?.reason;
               if (reason && !isClosed && clientWs.readyState === clientWs.OPEN) {
-                clientWs.send(JSON.stringify({ error: 'انقطع الاتصال بالصوت المباشر، تم التحويل للوضع التفاعلي.' }));
+                clientWs.send(JSON.stringify({ error: 'انقطع الاتصال بالصوت المباشر، تم التحويل للاستماع التلقائي.' }));
               }
               closeAll();
             },
           },
         });
+        sendReadySignal();
       } catch (err) {
         console.error('[Nova AI Live Setup Error]:', err);
         const mapped = mapGeminiError(err);
@@ -3583,7 +3600,7 @@ async function startServer() {
       if (!activeUid && !isClosed) {
         closeAll();
       }
-    }, 6000);
+    }, 12000);
 
     clientWs.on('message', (rawData) => {
       if (isClosed) return;
@@ -3593,7 +3610,7 @@ async function startServer() {
         frameWindowCount = 0;
       }
       frameWindowCount += 1;
-      if (frameWindowCount > 60) {
+      if (frameWindowCount > 80) {
         closeAll();
         return;
       }
@@ -3619,7 +3636,7 @@ async function startServer() {
             initializeLiveBridge(
               parsed.token.trim(),
               typeof parsed.otpToken === 'string' ? parsed.otpToken.trim() : '',
-              typeof parsed.voice === 'string' ? parsed.voice.trim() : 'Kore',
+              typeof parsed.voice === 'string' ? parsed.voice.trim() : 'Zephyr',
               typeof parsed.instruction === 'string' ? parsed.instruction.trim() : ''
             );
           } else {
